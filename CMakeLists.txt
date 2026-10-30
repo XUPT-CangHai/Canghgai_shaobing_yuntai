@@ -50,14 +50,16 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     BSP/bsp_remote.c
     Device/dji_motor.c
     Device/remote_control.c
+    Device/vision_aim.c
     Device/WIT_Gyro.c
     Device/BMI088driver.c
     Device/BMI088Middleware.c
+    Device/quaternion_ekf.c
     Device/ist8310driver.c
     Device/ist8310driver_middleware.c
     Algorithm/pid.c
     Application/shoot_test.c
-    # CAN2 6020 ID1 Yaw + ID3 Pitch, updated alongside CAN1 shooting in main.
+    # CAN2 6020 ID2 Yaw + ID3 Pitch; ID1 is not controlled.
     Application/pitch_test.c
 )
 

@@ -28,11 +28,14 @@
 #include "tim.h"
 #include "usart.h"
 #include "usb_device.h"
+#include "BMI088driver.h"
+#include "quaternion_ekf.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "shoot_test.h"
 #include "pitch_test.h"
+#include "vision_aim.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -56,6 +59,10 @@
 static uint32_t control_tick_ms;
 static uint32_t debug_tick_ms;
 static uint32_t heartbeat_tick_ms;
+quaternion_ekf_t g_ekf;
+float g_imu_gyro_bias[3];
+float g_imu_accel[3], g_imu_gyro[3], g_imu_temp;
+static uint32_t g_imu_tick_ms;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,6 +74,26 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+static void BMI088_CalibrateGyro(void)
+{
+  float gyro[3], accel[3], temp;
+  float sum[3] = {0.0f, 0.0f, 0.0f};
+  for (uint16_t i = 0U; i < 200U; i++)
+  {
+    BMI088_read(gyro, accel, &temp);
+    sum[0] += gyro[0]; sum[1] += gyro[1]; sum[2] += gyro[2];
+    HAL_Delay(2U);
+  }
+  g_imu_gyro_bias[0] = sum[0] / 200.0f;
+  g_imu_gyro_bias[1] = sum[1] / 200.0f;
+  g_imu_gyro_bias[2] = sum[2] / 200.0f;
+}
+
+static void BMI088_Update(void)
+{
+  BMI088_read(g_imu_gyro, g_imu_accel, &g_imu_temp);
+  QuaternionEKF_Update(&g_ekf, g_imu_gyro, g_imu_accel, 0.002f);
+}
 /* USER CODE END 0 */
 
 /**
@@ -118,11 +145,21 @@ int main(void)
   MX_I2C3_Init();
   MX_SPI1_Init();
   MX_SPI2_Init();
+  if (BMI088_init() != BMI088_NO_ERROR) { Error_Handler(); }
+  BMI088_CalibrateGyro();
+  QuaternionEKF_Init(&g_ekf);
+  g_ekf.gyro_bias[0] = g_imu_gyro_bias[0];
+  g_ekf.gyro_bias[1] = g_imu_gyro_bias[1];
+  g_ekf.gyro_bias[2] = g_imu_gyro_bias[2];
   MX_TIM14_Init();
+  /* 视觉流解析器必须先初始化，再启动 USB CDC 接收�?*/
+  Vision_Aim_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
+  /* 云台调试串口接收自瞄开关；USB CDC 仅接收视觉角度帧�?*/
+  Vision_Aim_DebugUartStart();
   Shoot_Test_Init();
-  /* CAN1发射与CAN2 Yaw/Pitch共用遥控器，外设由Shoot_Test_Init统一启动。 */
+  /* CAN1发射与CAN2 Yaw/Pitch共用遥控器，外设由Shoot_Test_Init统一启动�?*/
   Pitch_Test_Init();
   control_tick_ms = HAL_GetTick();
   debug_tick_ms = control_tick_ms;
@@ -139,13 +176,18 @@ int main(void)
     if ((uint32_t)(HAL_GetTick() - control_tick_ms) >= 2U)
     {
       control_tick_ms = HAL_GetTick();
+      if ((uint32_t)(HAL_GetTick() - g_imu_tick_ms) >= 2U)
+      {
+        g_imu_tick_ms += 2U;
+        BMI088_Update();
+      }
       Shoot_Test_Update();
-      /* 每2ms更新CAN2的6020 ID1 Yaw和ID3 Pitch位置控制。 */
+      /* �?ms更新CAN2�?020 ID2 Yaw和ID3 Pitch位置控制，ID1不控制�?*/
       Pitch_Test_Update();
     }
 
 #if PITCH_TUNING_DEBUG
-    /* Pitch调参使用20Hz快照，采样期间只输出CAN2 ID3，不与整车DMA抢占。 */
+    /* Pitch调参使用20Hz快照，采样期间只输出CAN2 ID3，不与整车DMA抢占�?*/
     if ((uint32_t)(HAL_GetTick() - debug_tick_ms) >= PITCH_DEBUG_PERIOD_MS)
     {
       debug_tick_ms = HAL_GetTick();
