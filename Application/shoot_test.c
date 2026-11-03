@@ -209,7 +209,8 @@ void Shoot_Test_DebugPrint(void)
     remote_source = Remote_Control_GetSource();
     /* 两个6020角度合并到同一条DMA输出，避免多次发送相互占用。 */
     DJI_6020_GetFeedback(2U, &pitch_feedback);
-    DJI_6020_GetFeedback(0U, &yaw_feedback);
+    /* 当前 Yaw 使用 6020 ID2，反馈数组下标为1；ID1不控制。 */
+    DJI_6020_GetFeedback(1U, &yaw_feedback);
     Pitch_Test_GetYawDebug(&yaw_mode,
                            &yaw_channel,
                            &yaw_angle10_debug,

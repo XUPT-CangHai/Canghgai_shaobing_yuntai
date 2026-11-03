@@ -57,7 +57,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Device/WIT_Gyro.c
     Device/BMI088driver.c
     Device/BMI088Middleware.c
-    Device/quaternion_ekf.c
+    Device/imu_dynamic_ekf.c
+    Device/imu_system.c # 新增 IMU 系统模块；保留现有工具链配置。
+    Device/imu_temperature_control.c
     Device/ist8310driver.c
     Device/ist8310driver_middleware.c
     Algorithm/pid.c

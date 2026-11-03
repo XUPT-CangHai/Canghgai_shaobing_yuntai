@@ -13,7 +13,7 @@
             "overrideLaunchCommands": [
                 "monitor reset halt",
                 "load build/Debug/shaobing_yuntai.elf",
-                "monitor reset halt"
+                "monitor reset"
             ],
             "serverpath": "D:/openocd-20260302/OpenOCD-20260302-0.12.0/bin/openocd.exe",
             "searchDir": [
@@ -31,7 +31,6 @@
             // 在加载符号前禁用GDB自行打开源码，避免Windows路径转换损坏中文；源码由VSCode直接打开。
             "debuggerArgs": ["-ex", "set source open off"],
             "interface": "swd",
-            "runToEntryPoint": "main",
             "showDevDebugOutput": "none"
         },
         {
@@ -44,10 +43,9 @@
             "servertype": "stlink",
             // 保留 ST-Link 原有复位流程，仅将下载改成相对路径。
             "overrideLaunchCommands": [
-                "monitor reset",
+                "monitor reset halt",
                 "load build/Debug/shaobing_yuntai.elf",
-                "monitor reset",
-                "monitor halt"
+                "monitor reset"
             ],
             "serverpath": "C:/Users/abcd1/AppData/Local/stm32cube/bundles/stlink-gdbserver/7.13.0+st.3/bin/ST-LINK_gdbserver.exe",
             "stm32cubeprogrammer": "C:/Users/abcd1/AppData/Local/stm32cube/bundles/programmer/2.22.0+st.1/bin",
@@ -56,7 +54,6 @@
             "debuggerArgs": ["-ex", "set source open off"],
             "device": "STM32F407IG",
             "interface": "swd",
-            "runToEntryPoint": "main",
             "showDevDebugOutput": "none"
         }
     ]

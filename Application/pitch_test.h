@@ -3,9 +3,9 @@
 
 #include <stdint.h>
 
-/* Pitch调参时每50ms输出一次；改为0恢复原有每秒整车状态输出。 */
+/* USART6 仅输出自瞄相关调试信息，由主循环每秒调用一次。 */
 #define PITCH_TUNING_DEBUG 1
-#define PITCH_DEBUG_PERIOD_MS 50U
+#define PITCH_DEBUG_PERIOD_MS 1000U
 
 void Pitch_Test_Init(void);
 void Pitch_Test_Update(void);
@@ -18,5 +18,7 @@ void Pitch_Test_GetYawDebug(uint8_t *mode,
                             int16_t *target_rpm,
                             int16_t *speed_rpm,
                             int16_t *current);
+uint8_t Pitch_Test_IsAimActive(void);
+int8_t Pitch_Test_GetYawLimit(void);
 
 #endif

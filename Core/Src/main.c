@@ -29,10 +29,9 @@
 #include "usart.h"
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
-#include "BMI088driver.h"
-#include "quaternion_ekf.h"
-#include <stdio.h>
+#include "imu_system.h"
 #include <math.h>
+#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -48,7 +47,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define VISION_IMU_SEND_PERIOD_MS 5U /* USB 虚拟串口每 5ms 上报，目标频率 200Hz。 */
+#define IMU_STATUS_LED_PWM 50000U
+#define IMU_DEBUG_PERIOD_MS 100U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -59,28 +60,25 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+extern USBD_HandleTypeDef hUsbDeviceFS;
 static uint32_t control_tick_ms;
 
-static uint32_t heartbeat_tick_ms;
-quaternion_ekf_t g_ekf;
-float g_imu_gyro_bias[3];
-float g_imu_accel[3], g_imu_gyro[3], g_imu_temp;
 static uint32_t g_imu_tick_ms;
-static uint32_t raw_debug_tick_ms;
+static uint32_t imu_debug_warmup_tick_ms;
+static uint32_t vision_imu_tick_ms;
+static uint32_t aim_debug_tick_ms;
 static uint32_t boot_tick_ms;
 static uint16_t vision_frame_seq;
-/* Reference temperature controller: TIM10 CH1, compare counts (ARR=4999). */
-static uint8_t imu_calibration_done, imu_calibration_active;
-static const float RefTemp = 40.0f;
-static const float HeatKp = 1000.0f, HeatKi = 20.0f;
-static const float HeatIntegralLimit = 300.0f, HeatMaxOut = 2000.0f;
-static float heat_integral;
-static uint16_t heat_pwm;
-static uint8_t heat_ready;
-static uint32_t heat_start_tick;
-static uint32_t heat_pi_tick;
-static uint8_t heat_calibration_paused;
-static uint8_t heat_pi_started;
+typedef enum
+{
+  IMU_LED_WARMING = 0U,
+  IMU_LED_STABLE,
+  IMU_LED_CALIBRATING,
+  IMU_LED_READY
+} imu_led_state_t;
+static imu_led_state_t imu_led_state;
+static uint8_t imu_led_phase;
+static uint32_t imu_led_tick;
 
 /* USER CODE END PV */
 
@@ -117,84 +115,142 @@ static int16_t Vision_Scaled100(float value)
   return (int16_t)lroundf(scaled);
 }
 
+/* TIM5 CH1/CH2/CH3 分别连接蓝/绿/红灯，使用 PWM 设置 RGB 亮度。 */
+static void IMU_StatusLed_Output(uint16_t red, uint16_t green, uint16_t blue)
+{
+  __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, blue);
+  __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_2, green);
+  __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_3, red);
+}
+
+static void IMU_StatusLed_Set(imu_led_state_t state)
+{
+  imu_led_state = state;
+  imu_led_phase = 1U;
+  imu_led_tick = HAL_GetTick();
+  if (state == IMU_LED_WARMING) IMU_StatusLed_Output(IMU_STATUS_LED_PWM, 0U, 0U);
+  else if (state == IMU_LED_STABLE) IMU_StatusLed_Output(IMU_STATUS_LED_PWM, IMU_STATUS_LED_PWM, 0U);
+  else if (state == IMU_LED_CALIBRATING) IMU_StatusLed_Output(0U, 0U, IMU_STATUS_LED_PWM);
+  else IMU_StatusLed_Output(0U, IMU_STATUS_LED_PWM, 0U);
+}
+
+static void IMU_StatusLed_Update(void)
+{
+  uint32_t now = HAL_GetTick();
+  uint32_t period = (imu_led_state == IMU_LED_CALIBRATING) ? 250U : 500U;
+  if (imu_led_state == IMU_LED_READY)
+  {
+    IMU_StatusLed_Output(0U, IMU_STATUS_LED_PWM, 0U);
+    return;
+  }
+  if ((uint32_t)(now - imu_led_tick) >= period)
+  {
+    imu_led_tick = now;
+    imu_led_phase ^= 1U;
+    if (imu_led_phase == 0U) IMU_StatusLed_Output(0U, 0U, 0U);
+    else if (imu_led_state == IMU_LED_WARMING) IMU_StatusLed_Output(IMU_STATUS_LED_PWM, 0U, 0U);
+    else if (imu_led_state == IMU_LED_STABLE) IMU_StatusLed_Output(IMU_STATUS_LED_PWM, IMU_STATUS_LED_PWM, 0U);
+    else IMU_StatusLed_Output(0U, 0U, IMU_STATUS_LED_PWM);
+  }
+}
+
 /* AA 55 + length(0x15) + 19-byte payload + CRC = 23 bytes. */
 static void Vision_SendImuFrame(void)
 {
   static uint8_t frame[23];
-  if (!imu_calibration_done) return;
+  const imu_system_t *imu = IMU_System_GetData();
+  USBD_CDC_HandleTypeDef *cdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+  if (!imu->initialized) return;
+  /* USB 未连接或上一帧尚未发完时跳过，避免改写正在发送的缓冲。 */
+  if ((hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) ||
+      (cdc == NULL) || (cdc->TxState != 0U)) return;
   frame[0] = 0xAAU; frame[1] = 0x55U; frame[2] = 0x15U;
   Vision_PutU32(&frame[3], HAL_GetTick() - boot_tick_ms);
   Vision_PutU16(&frame[7], vision_frame_seq++);
-  Vision_PutU16(&frame[9], (uint16_t)Vision_Scaled100((g_imu_gyro[0] - g_imu_gyro_bias[0]) * 57.29578f));
-  Vision_PutU16(&frame[11], (uint16_t)Vision_Scaled100((g_imu_gyro[1] - g_imu_gyro_bias[1]) * 57.29578f));
-  Vision_PutU16(&frame[13], (uint16_t)Vision_Scaled100((g_imu_gyro[2] - g_imu_gyro_bias[2]) * 57.29578f));
-  Vision_PutU16(&frame[15], (uint16_t)Vision_Scaled100(g_ekf.yaw * 57.29578f));
-  Vision_PutU16(&frame[17], (uint16_t)Vision_Scaled100(g_ekf.pitch * 57.29578f));
-  Vision_PutU16(&frame[19], (uint16_t)Vision_Scaled100(g_ekf.roll * 57.29578f));
-  frame[21] = (uint8_t)(1U | 2U | 4U | (g_ekf.accel_valid ? 8U : 0U));
+  /* BMI088_read has removed the XYZ base offset; EKF removes residual X/Y bias. */
+  Vision_PutU16(&frame[9], (uint16_t)Vision_Scaled100((imu->gyro[0] - imu->ekf.gyro_bias[0]) * 57.29578f));
+  Vision_PutU16(&frame[11], (uint16_t)Vision_Scaled100((imu->gyro[1] - imu->ekf.gyro_bias[1]) * 57.29578f));
+  Vision_PutU16(&frame[13], (uint16_t)Vision_Scaled100((imu->gyro[2] - imu->ekf.gyro_bias[2]) * 57.29578f));
+  Vision_PutU16(&frame[15], (uint16_t)Vision_Scaled100(imu->ekf.yaw * 57.29578f));
+  Vision_PutU16(&frame[17], (uint16_t)Vision_Scaled100(imu->ekf.pitch * 57.29578f));
+  Vision_PutU16(&frame[19], (uint16_t)Vision_Scaled100(imu->ekf.roll * 57.29578f));
+  frame[21] = (uint8_t)(1U | 2U | 4U | (imu->ekf.accel_valid ? 8U : 0U));
   frame[22] = Vision_Crc8(frame, 22U);
   (void)CDC_Transmit_FS(frame, sizeof(frame));
 }
 
-static void IMU_Temperature_Ctrl(float temperature, float dt)
+static void IMU_Temperature_SetPWM(uint16_t pwm)
 {
-  uint32_t now=HAL_GetTick();
-  if (!isfinite(temperature)) return;
-  if (!heat_pi_started && temperature >= RefTemp-0.5f) { heat_pi_started=1U; heat_pi_tick=now; }
-  if (!heat_pi_started) { heat_pwm=4500U; __HAL_TIM_SET_COMPARE(&htim10,TIM_CHANNEL_1,heat_pwm); return; }
-  heat_integral=fmaxf(-HeatIntegralLimit,fminf(HeatIntegralLimit,heat_integral+HeatKi*(RefTemp-temperature)*dt));
-  heat_pwm=(uint16_t)fmaxf(0.0f,fminf(HeatMaxOut,HeatKp*(RefTemp-temperature)+heat_integral));
-  __HAL_TIM_SET_COMPARE(&htim10,TIM_CHANNEL_1,heat_pwm);
-}
-static void IMU_Temperature_Start(void){heat_integral=0;heat_pwm=0;heat_pi_started=0;heat_ready=0;heat_calibration_paused=0;heat_start_tick=HAL_GetTick();if(HAL_TIM_PWM_Start(&htim10,TIM_CHANNEL_1)!=HAL_OK)Error_Handler();}
-static void BMI088_Update(void){BMI088_read(g_imu_gyro,g_imu_accel,&g_imu_temp);}
-static void IMU_Temperature_Wait(void){uint32_t last=HAL_GetTick(),start=last;for(;;){uint32_t now=HAL_GetTick();if(now-last<2)continue;float dt=(now-last)*.001f;last=now;BMI088_Update();IMU_Temperature_Ctrl(g_imu_temp,dt);if((heat_pi_started&&now-heat_pi_tick>=1000U)||(now-start>=100000U)){heat_calibration_paused=1;heat_pwm=0;__HAL_TIM_SET_COMPARE(&htim10,TIM_CHANNEL_1,0);break;}}heat_ready=1;}
-static void BMI088_CalibrateGyro(void)
-{
-  float g[3], a[3], t, sum[3] = {0};
-  uint32_t print_tick = HAL_GetTick();
-  imu_calibration_active = 1U;
-  for (uint16_t i = 0U; i < 200U; i++)
-  {
-    BMI088_read(g, a, &t);
-    g_imu_temp = t;
-    sum[0] += g[0]; sum[1] += g[1]; sum[2] += g[2];
-    if ((uint32_t)(HAL_GetTick() - print_tick) >= 100U)
-    {
-      print_tick = HAL_GetTick();
-      BMI088_PrintRaw();
-    }
-    HAL_Delay(2U);
-  }
-  for (int i = 0; i < 3; i++) g_imu_gyro_bias[i] = sum[i] / 200.0f;
-  imu_calibration_active = 0U;
+  __HAL_TIM_SET_COMPARE(&htim10, TIM_CHANNEL_1, pwm);
 }
 
-static void BMI088_PrintRaw(void)
+static void IMU_DebugPrint(void)
 {
-  Vision_SendImuFrame();
-  if (huart6.gState == HAL_UART_STATE_READY)
+  static char message[256];
+  const imu_system_t *imu = IMU_System_GetData();
+  uint32_t now_ms = HAL_GetTick();
+  int length;
+
+  if (huart6.gState != HAL_UART_STATE_READY) return;
+  length = snprintf(message, sizeof(message),
+                    "ms=%lu A=%.3f,%.3f,%.3f AF=%.3f,%.3f,%.3f "
+                    "G=%.3f,%.3f,%.3f YPR=%.2f,%.2f,%.2f T=%.2f "
+                    "DT=%lu STABLE=%u DVALID=%u CHI=%.4f DB=%.4f,%.4f,%.4f\r\n",
+                    (unsigned long)(now_ms - boot_tick_ms),
+                    (double)imu->accel[0], (double)imu->accel[1], (double)imu->accel[2],
+                    (double)imu->accel_filtered[0],
+                    (double)imu->accel_filtered[1],
+                    (double)imu->accel_filtered[2],
+                    (double)imu->gyro[0], (double)imu->gyro[1], (double)imu->gyro[2],
+                    (double)(imu->ekf.yaw * 57.29578f),
+                    (double)(imu->ekf.pitch * 57.29578f),
+                    (double)(imu->ekf.roll * 57.29578f),
+                    (double)imu->temperature,
+                    (unsigned long)imu->dt_us,
+                    (unsigned int)imu->ekf.stable,
+                    (unsigned int)imu->ekf.accel_valid,
+                    (double)imu->ekf.chi_square,
+                    (double)imu->ekf.gyro_bias[0],
+                    (double)imu->ekf.gyro_bias[1],
+                    (double)imu->ekf.gyro_bias[2]);
+  if ((length > 0) && (length < (int)sizeof(message)))
   {
-    static char line[320];
-    int n = snprintf(line, sizeof(line),
-      "ms=%lu A=%.3f,%.3f,%.3f G=%.3f,%.3f,%.3f "
-      "B=%.3f,%.3f,%.3f C=%.3f,%.3f,%.3f "
-      "YPR=%.2f,%.2f,%.2f T=%.2f EKF=%.4f valid=%u PI=%u PWM=%u\r\n",
-      (unsigned long)(HAL_GetTick() - boot_tick_ms),
-      (double)g_imu_accel[0], (double)g_imu_accel[1], (double)g_imu_accel[2],
-      (double)(g_imu_gyro[0] * 57.29578f), (double)(g_imu_gyro[1] * 57.29578f), (double)(g_imu_gyro[2] * 57.29578f),
-      (double)(g_imu_gyro_bias[0] * 57.29578f), (double)(g_imu_gyro_bias[1] * 57.29578f), (double)(g_imu_gyro_bias[2] * 57.29578f),
-      (double)((g_imu_gyro[0] - g_imu_gyro_bias[0]) * 57.29578f),
-      (double)((g_imu_gyro[1] - g_imu_gyro_bias[1]) * 57.29578f),
-      (double)((g_imu_gyro[2] - g_imu_gyro_bias[2]) * 57.29578f),
-      (double)(g_ekf.yaw * 57.29578f), (double)(g_ekf.pitch * 57.29578f),
-      (double)(g_ekf.roll * 57.29578f), (double)g_imu_temp,
-      (double)g_ekf.innovation, (unsigned)g_ekf.accel_valid,
-      (unsigned)heat_pi_started, (unsigned)heat_pwm);
-    if (n > 0 && n < (int)sizeof(line))
-      (void)HAL_UART_Transmit_DMA(&huart6, (uint8_t *)line, (uint16_t)n);
+    (void)HAL_UART_Transmit_DMA(&huart6, (uint8_t *)message, (uint16_t)length);
   }
 }
+
+static void IMU_DebugPrintIfDue(void)
+{
+  uint32_t now_ms = HAL_GetTick();
+  if ((uint32_t)(now_ms - imu_debug_warmup_tick_ms) < IMU_DEBUG_PERIOD_MS) return;
+  imu_debug_warmup_tick_ms = now_ms;
+  /* IMU_DebugPrint(); */
+}
+
+static uint32_t IMU_GetTickMs(void)
+{
+  return HAL_GetTick();
+}
+
+static uint8_t IMU_HeaterStart(void)
+{
+  return (uint8_t)(HAL_TIM_PWM_Start(&htim10, TIM_CHANNEL_1) == HAL_OK);
+}
+
+static void IMU_StageChanged(imu_system_stage_t stage)
+{
+  if (stage == IMU_SYSTEM_WARMING) IMU_StatusLed_Set(IMU_LED_WARMING);
+  else if (stage == IMU_SYSTEM_TEMPERATURE_STABLE) IMU_StatusLed_Set(IMU_LED_STABLE);
+  else if (stage == IMU_SYSTEM_CALIBRATING) IMU_StatusLed_Set(IMU_LED_CALIBRATING);
+  else IMU_StatusLed_Set(IMU_LED_READY);
+}
+
+static void IMU_StartupProgress(void)
+{
+  IMU_DebugPrintIfDue();
+  IMU_StatusLed_Update();
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -247,17 +303,14 @@ int main(void)
   MX_SPI1_Init();
   MX_SPI2_Init();
   boot_tick_ms = HAL_GetTick();
-  /* Match reference startup order: PWM first, then BMI088 and estimator init. */
-  IMU_Temperature_Start();
-  if (BMI088_init() != BMI088_NO_ERROR) { Error_Handler(); }
-  IMU_Temperature_Wait();
-  BMI088_CalibrateGyro();
-  heat_calibration_paused = 0U;
-  imu_calibration_done = 1U;
-  QuaternionEKF_Init(&g_ekf);
-  g_ekf.gyro_bias[0] = g_imu_gyro_bias[0];
-  g_ekf.gyro_bias[1] = g_imu_gyro_bias[1];
-  g_ekf.gyro_bias[2] = g_imu_gyro_bias[2];
+  imu_debug_warmup_tick_ms = boot_tick_ms;
+  imu_system_config_t imu_config = {
+      .get_tick_ms = IMU_GetTickMs,
+      .heater_start = IMU_HeaterStart,
+      .heater_set_pwm = IMU_Temperature_SetPWM,
+      .stage_changed = IMU_StageChanged,
+      .progress = IMU_StartupProgress};
+  if (!IMU_System_Init(&imu_config)) Error_Handler();
   MX_TIM14_Init();
   /* 视觉流解析器必须先初始化，再启动 USB CDC 接收�?*/
   Vision_Aim_Init();
@@ -271,8 +324,8 @@ int main(void)
   control_tick_ms = HAL_GetTick();
   g_imu_tick_ms = control_tick_ms;
 
-  heartbeat_tick_ms = control_tick_ms;
-  raw_debug_tick_ms = control_tick_ms;
+  vision_imu_tick_ms = control_tick_ms;
+  aim_debug_tick_ms = control_tick_ms;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -287,29 +340,33 @@ int main(void)
       control_tick_ms = HAL_GetTick();
       if ((uint32_t)(HAL_GetTick() - g_imu_tick_ms) >= 2U)
       {
-        float imu_dt = (float)(HAL_GetTick() - g_imu_tick_ms) * 0.001f;
-        g_imu_tick_ms = HAL_GetTick();
-        BMI088_Update();
-        IMU_Temperature_Ctrl(g_imu_temp, imu_dt);
-
-        QuaternionEKF_Update(&g_ekf, g_imu_gyro, g_imu_accel, imu_dt);
+        uint32_t imu_now_ms = HAL_GetTick();
+        uint32_t imu_elapsed_ms = imu_now_ms - g_imu_tick_ms;
+        float imu_dt = (float)imu_elapsed_ms * 0.001f;
+        g_imu_tick_ms = imu_now_ms;
+        IMU_System_Update(imu_dt);
       }
-      if ((uint32_t)(HAL_GetTick() - raw_debug_tick_ms) >= 100U)
-      {
-        raw_debug_tick_ms = HAL_GetTick();
-        BMI088_PrintRaw();
-      }
-      /* Other periodic control outputs disabled during IMU observation. */
+      Pitch_Test_Update();
+      /* Shooter output remains disabled during IMU and gimbal observation. */
       /* �?ms更新CAN2�?020 ID2 Yaw和ID3 Pitch位置控制，ID1不控制�?*/
 
     }
 
-/* IMU inspection: other periodic UART telemetry disabled. */
-    if ((uint32_t)(HAL_GetTick() - heartbeat_tick_ms) >= 500U)
+    /* 独立按 5ms 调度 USB，避免受 2ms 控制周期影响变成每 6ms 一帧。 */
+    if ((uint32_t)(HAL_GetTick() - vision_imu_tick_ms) >= VISION_IMU_SEND_PERIOD_MS)
     {
-      heartbeat_tick_ms = HAL_GetTick();
-      HAL_GPIO_TogglePin(LED_G_GPIO_Port, LED_G_Pin);
+      vision_imu_tick_ms = HAL_GetTick();
+      Vision_SendImuFrame();
     }
+
+    /* USART6 每秒输出一次自瞄调试数据。 */
+    if ((uint32_t)(HAL_GetTick() - aim_debug_tick_ms) >= PITCH_DEBUG_PERIOD_MS)
+    {
+      aim_debug_tick_ms = HAL_GetTick();
+      Pitch_Test_DebugPrint();
+      /* IMU_DebugPrint(); */
+    }
+    IMU_StatusLed_Update();
   }
   /* USER CODE END 3 */
 }

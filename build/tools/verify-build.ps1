@@ -21,7 +21,7 @@ try {
         $taskObjects += $taskEntry.output
     }
     $taskLinkArgs = @('-mcpu=cortex-m4', '-mfpu=fpv4-sp-d16', '-mfloat-abi=hard', '-O0', '-g3',
-        '-T', (Join-Path $taskRoot 'STM32F407XX_FLASH.ld'), '--specs=nano.specs',
+        '-T', (Join-Path $taskRoot 'STM32F407XX_FLASH.ld'), '--specs=nano.specs', '-u', '_printf_float',
         '-Wl,-Map=shaobing_yuntai.map', '-Wl,--gc-sections', '-Wl,--print-memory-usage',
         '-o', 'shaobing_yuntai.elf')
     $taskLinkArgs += $taskObjects
