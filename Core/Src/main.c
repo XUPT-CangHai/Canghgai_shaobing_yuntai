@@ -184,8 +184,10 @@ static void IMU_Temperature_SetPWM(uint16_t pwm)
   __HAL_TIM_SET_COMPARE(&htim10, TIM_CHANNEL_1, pwm);
 }
 
+#if 0 /* 旧 IMU 调试串口输出已停用，USART6 改为 Pitch 快照专用。 */
 static void IMU_DebugPrint(void)
 {
+  /* 已停用：USART6 只保留每秒一次的 Pitch 快照输出。 */
   static char message[256];
   const imu_system_t *imu = IMU_System_GetData();
   uint32_t now_ms = HAL_GetTick();
@@ -218,9 +220,11 @@ static void IMU_DebugPrint(void)
     (void)HAL_UART_Transmit_DMA(&huart6, (uint8_t *)message, (uint16_t)length);
   }
 }
+#endif
 
 static void IMU_DebugPrintIfDue(void)
 {
+  /* 保留启动回调，但不再发送旧的 IMU 调试行。 */
   uint32_t now_ms = HAL_GetTick();
   if ((uint32_t)(now_ms - imu_debug_warmup_tick_ms) < IMU_DEBUG_PERIOD_MS) return;
   imu_debug_warmup_tick_ms = now_ms;
@@ -359,7 +363,7 @@ int main(void)
       Vision_SendImuFrame();
     }
 
-    /* USART6 每秒输出一次自瞄调试数据。 */
+    /* USART6 每秒只输出一次完整 Pitch 调试数据。 */
     if ((uint32_t)(HAL_GetTick() - aim_debug_tick_ms) >= PITCH_DEBUG_PERIOD_MS)
     {
       aim_debug_tick_ms = HAL_GetTick();

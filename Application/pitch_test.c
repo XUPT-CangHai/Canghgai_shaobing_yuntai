@@ -4,7 +4,6 @@
 
 #include "can.h"
 #include "dji_motor.h"
-#include "imu_system.h"
 #include "pid.h"
 #include "remote_control.h"
 #include "vision_aim.h"
@@ -491,77 +490,64 @@ void Pitch_Test_Update(void)
 
 void Pitch_Test_DebugPrint(void)
 {
-    const imu_system_t *imu = IMU_System_GetData();
+    remote_control_t remote = {0};
     vision_aim_command_t aim = {0};
-    dji_6020_feedback_t yaw_feedback = {0};
     dji_6020_feedback_t pitch_feedback = {0};
     static char message[512];
     uint32_t now_ms = HAL_GetTick();
     uint32_t frame_age_ms;
-    float yaw_angle;
     float pitch_angle;
-    float yaw_target;
-    int yaw_limit;
     int pitch_limit;
     int length;
 
-    /* 自瞄专用调试：上一条 DMA 未发完时，不改写发送缓冲。 */
+    /* 上一条 DMA 未发完时，不改写正在发送的 Pitch 快照。 */
     if (huart6.gState != HAL_UART_STATE_READY)
     {
         return;
     }
 
+    Remote_Control_Get(&remote);
     Vision_Aim_Get(&aim);
-    DJI_6020_GetFeedback(YAW_MOTOR_INDEX, &yaw_feedback);
     DJI_6020_GetFeedback(PITCH_MOTOR_INDEX, &pitch_feedback);
     frame_age_ms = (aim.valid_frame_count != 0U) ?
                    (uint32_t)(now_ms - aim.last_rx_tick_ms) : UINT32_MAX;
-    yaw_angle = Pitch_Test_GetAngle(&yaw_feedback);
     pitch_angle = Pitch_Test_GetAngle(&pitch_feedback);
-    yaw_target = (g_aim_active != 0U) ? g_aim_yaw_target_angle : g_yaw_target_angle;
-    yaw_limit = (yaw_angle <= YAW_ANGLE_MIN_DEG) ? -1 :
-                ((yaw_angle >= YAW_ANGLE_MAX_DEG) ? 1 : 0);
     pitch_limit = (pitch_angle <= PITCH_ANGLE_MIN_DEG) ? -1 :
                   ((pitch_angle >= PITCH_ANGLE_MAX_DEG) ? 1 : 0);
 
-    /* a/t/yerr/perr 单位为度；cur 为命令/反馈电流，age 单位为毫秒。 */
+    /* USART6 每秒输出一次完整 Pitch 快照，用于重力补偿测量。 */
     length = snprintf(message, sizeof(message),
-                      "AIM:enabled=%u active=%u valid=%u fresh=%u "
-                      "seq=%u yerr=%.2f perr=%.2f bytes=%lu frames=%lu new=%lu bad=%lu age=%lu "
-                      "Y:on=%u a=%.1f t=%.1f cur=%d/%d lim=%d "
-                      "P:on=%u a=%.1f t=%.1f cur=%d/%d lim=%d txfail=%lu "
-                      "IMU:yaw=%.2f roll=%.2f\r\n",
+                      "PIT:on=%u rc=%u/%u sw=%u ch=%d "
+                      "init=%u ecd=%u last=%u a=%.2f t=%.2f e=%.2f "
+                      "rpm=%d cmd=%d fbI=%d temp=%u int=%.1f lim=%d txfail=%lu "
+                      "AIM:en=%u active=%u valid=%u fresh=%u perr=%.2f seq=%u age=%lu\r\n",
+                      (unsigned int)DJI_6020_IsOnline(PITCH_MOTOR_INDEX, now_ms,
+                                                     PITCH_MOTOR_TIMEOUT_MS),
+                      (unsigned int)g_pitch_remote_online,
+                      (unsigned int)g_pitch_remote_valid,
+                      (unsigned int)remote.switch_position[RC_S_LEFT],
+                      (int)g_pitch_debug_channel,
+                      (unsigned int)g_pitch_target_initialized,
+                      (unsigned int)pitch_feedback.ecd,
+                      (unsigned int)pitch_feedback.last_ecd,
+                      (double)pitch_angle,
+                      (double)g_pitch_target_angle,
+                      (double)g_pitch_debug_error,
+                      (int)pitch_feedback.speed_rpm,
+                      (int)g_pitch_debug_current,
+                      (int)pitch_feedback.given_current,
+                      (unsigned int)pitch_feedback.temperature,
+                      (double)g_pitch_integral,
+                      pitch_limit,
+                      (unsigned long)g_pitch_can_tx_fail,
                       (unsigned int)aim.aim_enabled,
                       (unsigned int)g_aim_active,
                       (unsigned int)aim.target_valid,
                       (unsigned int)((aim.valid_frame_count != 0U) &&
                                      (frame_age_ms <= VISION_AIM_TIMEOUT_MS)),
-                      (unsigned int)aim.seq,
-                      (double)aim.yaw_error_cdeg / 100.0,
                       (double)aim.pitch_error_cdeg / 100.0,
-                      (unsigned long)aim.rx_byte_count,
-                      (unsigned long)aim.valid_frame_count,
-                      (unsigned long)aim.new_frame_count,
-                      (unsigned long)aim.checksum_error_count,
-                      (unsigned long)frame_age_ms,
-                      (unsigned int)DJI_6020_IsOnline(YAW_MOTOR_INDEX, now_ms,
-                                                     PITCH_MOTOR_TIMEOUT_MS),
-                      (double)yaw_angle,
-                      (double)yaw_target,
-                      (int)g_yaw_debug_current,
-                      (int)yaw_feedback.given_current,
-                      yaw_limit,
-                      (unsigned int)DJI_6020_IsOnline(PITCH_MOTOR_INDEX, now_ms,
-                                                     PITCH_MOTOR_TIMEOUT_MS),
-                      (double)pitch_angle,
-                      (double)g_pitch_target_angle,
-                      (int)g_pitch_debug_current,
-                      (int)pitch_feedback.given_current,
-                      pitch_limit,
-                      (unsigned long)g_pitch_can_tx_fail,
-                      /* EKF 内部为弧度，串口统一输出角度（度）。 */
-                      (double)(imu->ekf.yaw * 57.29578f),
-                      (double)(imu->ekf.roll * 57.29578f));
+                      (unsigned int)aim.seq,
+                      (unsigned long)frame_age_ms);
     if ((length > 0) && (length < (int)sizeof(message)))
     {
         (void)HAL_UART_Transmit_DMA(&huart6, (uint8_t *)message,

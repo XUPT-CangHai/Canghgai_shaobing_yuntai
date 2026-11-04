@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* USART6 仅输出自瞄相关调试信息，由主循环每秒调用一次。 */
+/* USART6 每秒输出一次完整 Pitch 调试快照。 */
 #define PITCH_TUNING_DEBUG 1
 #define PITCH_DEBUG_PERIOD_MS 1000U
 
