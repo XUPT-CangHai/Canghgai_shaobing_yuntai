@@ -72,3 +72,6 @@
 66	1072	8154119487758517	CMakeFiles/shaobing_yuntai.dir/Core/Src/main.c.obj	f4f1e91c1397256a
 429	1073	8154119491390140	CMakeFiles/shaobing_yuntai.dir/Device/imu_system.c.obj	2b1a64364a4e66a3
 1073	3299	8154119497828260	shaobing_yuntai.elf	f628d18712cca377
+15	2241	8154903834797423	CMakeFiles/shaobing_yuntai.dir/Device/imu_system.c.obj	2b1a64364a4e66a3
+194	2242	8154903836597720	CMakeFiles/shaobing_yuntai.dir/Application/pitch_test.c.obj	646def9cdca30a5
+2242	4266	8154903857081778	shaobing_yuntai.elf	f628d18712cca377

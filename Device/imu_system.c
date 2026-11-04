@@ -10,7 +10,9 @@
 #define IMU_TEMPERATURE_PI_START_PERCENT 90.0f /* 达到目标温度的此百分比时切入 PI。 */
 #define IMU_TEMPERATURE_STABLE_ERROR 0.25f
 #define IMU_TEMPERATURE_STABLE_MS 2000U
-#define IMU_TEMPERATURE_FEED_FORWARD_PWM 900.0f
+#define IMU_TEMPERATURE_COLD_START_THRESHOLD_C 25.0f
+#define IMU_TEMPERATURE_COLD_START_FEED_FORWARD_PWM 1100.0f
+#define IMU_TEMPERATURE_NORMAL_START_FEED_FORWARD_PWM 900.0f
 #define IMU_GYRO_CALIBRATION_SAMPLES 6000U
 #define IMU_ACCEL_INIT_SAMPLES 100U
 #define IMU_STATIC_GYRO_MAX_RAD_S 0.05f
@@ -219,10 +221,17 @@ uint8_t IMU_System_Init(const imu_system_config_t *config)
   g_temperature_controller.pi_start_temp =
       g_temperature_controller.target_temp *
       (IMU_TEMPERATURE_PI_START_PERCENT / 100.0f);
-  g_temperature_controller.feed_forward_pwm = IMU_TEMPERATURE_FEED_FORWARD_PWM;
   IMU_System_SetStage(IMU_SYSTEM_WARMING);
-  if (!g_config.heater_start()) return 0U;
   if (BMI088_init() != BMI088_NO_ERROR) return 0U;
+
+  /* 修改：加热前读取启动温度，冷启动和常温启动使用不同前馈。 */
+  IMU_System_ReadSensor();
+  g_temperature_controller.feed_forward_pwm =
+      (g_imu.temperature < IMU_TEMPERATURE_COLD_START_THRESHOLD_C) ?
+          IMU_TEMPERATURE_COLD_START_FEED_FORWARD_PWM :
+          IMU_TEMPERATURE_NORMAL_START_FEED_FORWARD_PWM;
+
+  if (!g_config.heater_start()) return 0U;
 
   IMU_System_WaitForTemperature();
   IMU_System_CalibrateGyro();
