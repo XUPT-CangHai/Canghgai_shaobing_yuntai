@@ -29,6 +29,12 @@
 #define AIM_YAW_ERROR_MAX_DEG    45.0f
 #define AIM_PITCH_ERROR_MAX_DEG  20.0f
 
+/* 视觉/串口共用的 Yaw 参数，遥控参数仍使用上面的原值。 */
+#define YAW_AIM_ANGLE_KP         2.8f
+#define YAW_AIM_SPEED_KP         180.0f
+#define YAW_AIM_SPEED_KI         0.35f /* 每 2ms 累加一次。 */
+#define YAW_AIM_SPEED_MAX_I      2000.0f
+
 #define PITCH_MOTOR_INDEX       2U       /* 6020 ID3锛屽弽棣堝抚 0x207銆?*/
 #define PITCH_MOTOR_TIMEOUT_MS  100U
 #define PITCH_REMOTE_TIMEOUT_MS 200U
@@ -120,6 +126,15 @@ static uint8_t g_yaw_mode = YAW_MODE_DISABLED;
 static float g_yaw_target_angle;
 static yaw_legacy_pid_t g_yaw_angle_pid;
 static yaw_legacy_pid_t g_yaw_speed_pid;
+
+/* 视觉与串口阶跃共用此组 PID；遥控器保留原来的参数。 */
+static yaw_legacy_pid_t g_yaw_aim_speed_pid;
+static float g_yaw_aim_angle_kp = YAW_AIM_ANGLE_KP;
+static float g_yaw_aim_max_rpm = YAW_ANGLE_MAX_RPM;
+static uint8_t g_yaw_serial_mode;
+static uint8_t g_yaw_debug_enabled;
+static float g_yaw_serial_target_angle;
+static uint32_t g_yaw_command_tick_ms;
 
 /* 渚涗覆鍙ｈ皟璇曡鍙栫殑 Yaw 鐘舵€侊紝鍗曚綅锛氳搴︿负0.1搴︺€?*/
 static int16_t g_yaw_debug_channel;
@@ -273,6 +288,22 @@ static float Pitch_SpeedPid_Position(yaw_legacy_pid_t *pid,
     return Pitch_Test_Clamp(pid->out, pid->max_out);
 }
 
+/* 独立保存积分，输出饱和时只允许消除饱和方向的积分。 */
+static float Yaw_AimSpeedPid(yaw_legacy_pid_t *pid, float target, float feedback)
+{
+    float error = target - feedback;
+    float request = pid->kp * error + pid->iout;
+
+    if (((request < pid->max_out) && (request > -pid->max_out)) ||
+        ((request >= pid->max_out) && (error < 0.0f)) ||
+        ((request <= -pid->max_out) && (error > 0.0f)))
+    {
+        pid->iout = Pitch_Test_Clamp(pid->iout + pid->ki * error, pid->max_iout);
+    }
+    pid->out = Pitch_Test_Clamp(pid->kp * error + pid->iout, pid->max_out);
+    return pid->out;
+}
+
 static float Pitch_Test_GetAngle(const dji_6020_feedback_t *feedback)
 {
     return ((float)feedback->ecd * 360.0f) / 8192.0f;
@@ -391,6 +422,82 @@ static void Pitch_Test_SerialProcess(float current_angle)
         line[i] = (char)toupper((unsigned char)line[i]);
     }
     line[sizeof(line) - 1U] = '\0';
+
+    /* Yaw 调试命令只设置目标，运动仍由主循环的视觉控制路径执行。 */
+    if (strcmp(line, "YAW STOP") == 0)
+    {
+        g_yaw_serial_mode = 0U;
+        g_yaw_target_initialized = 0U;
+        Yaw_LegacyPid_Clear(&g_yaw_aim_speed_pid);
+        Pitch_Test_SerialSend("ACK YAW STOP\r\n");
+        return;
+    }
+    if (strcmp(line, "YAW GET") == 0)
+    {
+        g_yaw_debug_enabled = 1U;
+        g_pitch_serial_status_request = 1U;
+        return;
+    }
+    if ((strncmp(line, "YAW SET ", 8U) == 0) ||
+        (strcmp(line, "YAW HOLD") == 0))
+    {
+        dji_6020_feedback_t feedback = {0};
+        if (strcmp(line, "YAW HOLD") == 0)
+        {
+            DJI_6020_GetFeedback(YAW_MOTOR_INDEX, &feedback);
+            target_angle = Yaw_ClampAngle(Pitch_Test_GetAngle(&feedback));
+        }
+        else if (!Pitch_Test_SerialParseFloat(&line[8], &target_angle))
+        {
+            Pitch_Test_SerialSend("ERR YAW SET angle\r\n");
+            return;
+        }
+        if ((target_angle < YAW_ANGLE_MIN_DEG) ||
+            (target_angle > YAW_ANGLE_MAX_DEG))
+        {
+            Pitch_Test_SerialSend("ERR YAW SET range=125..212\r\n");
+            return;
+        }
+        if (g_yaw_serial_mode == 0U)
+        {
+            Yaw_LegacyPid_Clear(&g_yaw_aim_speed_pid);
+        }
+        g_yaw_serial_target_angle = target_angle;
+        g_yaw_serial_mode = 1U;
+        g_yaw_debug_enabled = 1U;
+        g_yaw_command_tick_ms = HAL_GetTick();
+        Pitch_Test_SerialSend("ACK YAW SET\r\n");
+        return;
+    }
+    if (strncmp(line, "YAW TUNE ", 9U) == 0)
+    {
+        float values[4];
+        char *token = strtok(&line[9], " ");
+        for (i = 0U; i < 4U; i++)
+        {
+            if (!Pitch_Test_SerialParseFloat(token, &values[i]))
+            {
+                Pitch_Test_SerialSend("ERR YAW TUNE angle_kp speed_kp speed_ki max_rpm\r\n");
+                return;
+            }
+            token = strtok(NULL, " ");
+        }
+        if ((token != NULL) || (values[0] <= 0.0f) || (values[0] > 20.0f) ||
+            (values[1] <= 0.0f) || (values[1] > 400.0f) ||
+            (values[2] < 0.0f) || (values[2] > 2.0f) ||
+            (values[3] <= 0.0f) || (values[3] > 250.0f))
+        {
+            Pitch_Test_SerialSend("ERR YAW TUNE range\r\n");
+            return;
+        }
+        g_yaw_aim_angle_kp = values[0];
+        g_yaw_aim_speed_pid.kp = values[1];
+        g_yaw_aim_speed_pid.ki = values[2];
+        g_yaw_aim_max_rpm = values[3];
+        Yaw_LegacyPid_Clear(&g_yaw_aim_speed_pid);
+        Pitch_Test_SerialSend("ACK YAW TUNE\r\n");
+        return;
+    }
 
     if (strcmp(line, "PIT STOP") == 0)
     {
@@ -518,17 +625,19 @@ static int16_t Yaw_Update(const remote_control_t *remote,
     /* Yaw 浣跨敤 ID2锛涜嚜鐬勪笉渚濊禆閬ユ帶鍣紝寮€鍚絾鏃犳湁鏁堢洰鏍囨椂杈撳嚭闆剁數娴併€?*/
     if ((DJI_6020_IsOnline(YAW_MOTOR_INDEX, now_ms,
                             PITCH_MOTOR_TIMEOUT_MS) == 0U) ||
-        ((aim->aim_enabled != 0U) && (aim_active == 0U)) ||
+        ((g_yaw_serial_mode == 0U) &&
+        (((aim->aim_enabled != 0U) && (aim_active == 0U)) ||
         ((aim->aim_enabled == 0U) &&
          ((g_pitch_remote_online == 0U) ||
           (g_pitch_remote_valid == 0U) ||
-           (remote->switch_position[RC_S_LEFT] != RC_SW_MID))))
+           (remote->switch_position[RC_S_LEFT] != RC_SW_MID))))))
     {
         g_yaw_target_initialized = 0U;
         g_aim_yaw_applied_frame_count = 0U;
         g_yaw_mode = YAW_MODE_DISABLED;
         Yaw_LegacyPid_Clear(&g_yaw_angle_pid);
         Yaw_LegacyPid_Clear(&g_yaw_speed_pid);
+        Yaw_LegacyPid_Clear(&g_yaw_aim_speed_pid);
         g_yaw_debug_channel = 0;
         g_yaw_debug_angle10 = 0;
         g_yaw_debug_target10 = 0;
@@ -549,7 +658,14 @@ static int16_t Yaw_Update(const remote_control_t *remote,
         g_yaw_target_initialized = 1U;
     }
 
-    if (aim_active != 0U)
+    if (g_yaw_serial_mode != 0U)
+    {
+        angle_error = Pitch_Test_Clamp(
+            Yaw_ShortestError(g_yaw_serial_target_angle, current_angle),
+            AIM_YAW_ERROR_MAX_DEG);
+        g_yaw_mode = 4U;
+    }
+    else if (aim_active != 0U)
     {
         if (g_aim_yaw_applied_frame_count != aim->new_frame_count)
         {
@@ -609,15 +725,26 @@ static int16_t Yaw_Update(const remote_control_t *remote,
         }
     }
 
-    target_rpm = Yaw_LegacyPid_Position(&g_yaw_angle_pid, angle_error);
+    if ((g_yaw_serial_mode != 0U) || (aim_active != 0U))
+    {
+        /* 两条目标来源共用同一个视觉 Yaw 控制器。 */
+        target_rpm = Pitch_Test_Clamp(angle_error * g_yaw_aim_angle_kp,
+                                      g_yaw_aim_max_rpm);
+        g_yaw_debug_current = (int16_t)Yaw_AimSpeedPid(
+            &g_yaw_aim_speed_pid, target_rpm, (float)feedback.speed_rpm);
+    }
+    else
+    {
+        target_rpm = Yaw_LegacyPid_Position(&g_yaw_angle_pid, angle_error);
+        g_yaw_debug_current = (int16_t)Yaw_LegacyPid_Delta(
+            &g_yaw_speed_pid, target_rpm, (float)feedback.speed_rpm);
+    }
     g_yaw_debug_channel = remote->channel[0];
     g_yaw_debug_angle10 = (int16_t)(current_angle * 10.0f);
     g_yaw_debug_target10 = (int16_t)((current_angle + angle_error) * 10.0f);
     g_yaw_debug_error10 = (int16_t)(angle_error * 10.0f);
     g_yaw_debug_target_rpm = (int16_t)target_rpm;
     g_yaw_debug_speed_rpm = feedback.speed_rpm;
-    g_yaw_debug_current = (int16_t)Yaw_LegacyPid_Delta(
-        &g_yaw_speed_pid, target_rpm, (float)feedback.speed_rpm);
     return g_yaw_debug_current;
 }
 
@@ -654,6 +781,10 @@ void Pitch_Test_Init(void)
                        0.0f, YAW_ANGLE_MAX_RPM);
     Yaw_LegacyPid_Init(&g_yaw_speed_pid, YAW_SPEED_KP, YAW_SPEED_KI, 0.0f,
                        YAW_SPEED_MAX_I, YAW_CURRENT_LIMIT);
+    Yaw_LegacyPid_Init(&g_yaw_aim_speed_pid, YAW_AIM_SPEED_KP, YAW_AIM_SPEED_KI,
+                       0.0f, YAW_AIM_SPEED_MAX_I, YAW_CURRENT_LIMIT);
+    g_yaw_serial_mode = 0U;
+    g_yaw_debug_enabled = 0U;
     Yaw_LegacyPid_Init(&g_pitch_angle_pid, PITCH_CASCADE_ANGLE_KP, 0.0f,
                        0.0f, 0.0f, PITCH_CASCADE_MAX_RPM);
     Yaw_LegacyPid_Init(&g_pitch_speed_pid, PITCH_CASCADE_SPEED_KP,
@@ -707,6 +838,7 @@ void Pitch_Test_Update(void)
         Yaw_LegacyPid_Clear(&g_pitch_speed_pid);
         Yaw_LegacyPid_Clear(&g_yaw_angle_pid);
         Yaw_LegacyPid_Clear(&g_yaw_speed_pid);
+        Yaw_LegacyPid_Clear(&g_yaw_aim_speed_pid);
     }
 
     /* 鑷瀯鐢?USART6 鐙珛浣胯兘锛涘彧鏈夋墜鍔ㄦā寮忚姹傞仴鎺у湪绾夸笖宸﹀紑鍏崇疆涓€?*/
@@ -843,6 +975,11 @@ void Pitch_Test_Update(void)
     }
 }
 
+uint32_t Pitch_Test_DebugPeriodMs(void)
+{
+    return (g_yaw_debug_enabled != 0U) ? 20U : PITCH_DEBUG_PERIOD_MS;
+}
+
 void Pitch_Test_DebugPrint(void)
 {
     remote_control_t remote = {0};
@@ -858,6 +995,33 @@ void Pitch_Test_DebugPrint(void)
     /* 上一条 DMA 未发完时，不改写正在发送的 Pitch 快照。 */
     if (huart6.gState != HAL_UART_STATE_READY)
     {
+        return;
+    }
+
+    if (g_yaw_debug_enabled != 0U)
+    {
+        dji_6020_feedback_t yaw = {0};
+        DJI_6020_GetFeedback(YAW_MOTOR_INDEX, &yaw);
+        /* 板上时间戳避免 Windows 串口缓冲影响收敛时间测量。 */
+        length = snprintf(message, sizeof(message),
+            "YAW:ms=%lu setms=%lu on=%u serial=%u a=%.2f t=%.2f "
+            "e=%.2f rpm=%d trpm=%d cmd=%d fbI=%d temp=%u\r\n",
+            (unsigned long)now_ms, (unsigned long)g_yaw_command_tick_ms,
+            (unsigned int)DJI_6020_IsOnline(YAW_MOTOR_INDEX, now_ms,
+                                           PITCH_MOTOR_TIMEOUT_MS),
+            (unsigned int)g_yaw_serial_mode,
+            (double)Pitch_Test_GetAngle(&yaw),
+            (double)((g_yaw_serial_mode != 0U) ? g_yaw_serial_target_angle :
+                     ((float)g_yaw_debug_target10 / 10.0f)),
+            (double)g_yaw_debug_error10 / 10.0f,
+            (int)yaw.speed_rpm, (int)g_yaw_debug_target_rpm,
+            (int)g_yaw_debug_current, (int)yaw.given_current,
+            (unsigned int)yaw.temperature);
+        if ((length > 0) && (length < (int)sizeof(message)))
+        {
+            (void)HAL_UART_Transmit_DMA(&huart6, (uint8_t *)message,
+                                       (uint16_t)length);
+        }
         return;
     }
 

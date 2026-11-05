@@ -90,3 +90,10 @@
 423	946	8155785360245377	shaobing_yuntai.elf	f628d18712cca377
 55	460	8155793266053440	CMakeFiles/shaobing_yuntai.dir/Application/pitch_test.c.obj	646def9cdca30a5
 460	1013	8155793270108412	shaobing_yuntai.elf	f628d18712cca377
+302	1053	8155810416683257	CMakeFiles/shaobing_yuntai.dir/Device/vision_aim.c.obj	90c234ba6b9b902
+321	1055	8155810416873467	CMakeFiles/shaobing_yuntai.dir/Application/shoot_test.c.obj	f84f934d646374de
+336	1065	8155810417021595	CMakeFiles/shaobing_yuntai.dir/Application/pitch_test.c.obj	646def9cdca30a5
+6	1173	8155810413709300	CMakeFiles/shaobing_yuntai.dir/Core/Src/main.c.obj	f4f1e91c1397256a
+1173	1987	8155810425383445	shaobing_yuntai.elf	f628d18712cca377
+42	463	8155813517605382	CMakeFiles/shaobing_yuntai.dir/Application/pitch_test.c.obj	646def9cdca30a5
+464	951	8155813521822739	shaobing_yuntai.elf	f628d18712cca377

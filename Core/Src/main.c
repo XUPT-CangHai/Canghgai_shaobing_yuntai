@@ -366,7 +366,7 @@ int main(void)
     }
 
     /* USART6 每秒只输出一次完整 Pitch 调试数据。 */
-    if ((uint32_t)(HAL_GetTick() - aim_debug_tick_ms) >= PITCH_DEBUG_PERIOD_MS)
+    if ((uint32_t)(HAL_GetTick() - aim_debug_tick_ms) >= Pitch_Test_DebugPeriodMs())
     {
       aim_debug_tick_ms = HAL_GetTick();
       Pitch_Test_DebugPrint();

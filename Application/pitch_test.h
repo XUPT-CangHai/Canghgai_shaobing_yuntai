@@ -10,6 +10,8 @@
 void Pitch_Test_Init(void);
 void Pitch_Test_Update(void);
 void Pitch_Test_DebugPrint(void);
+/* Yaw 调参时使用 20ms 板上时间戳快照，其余仍为 100ms。 */
+uint32_t Pitch_Test_DebugPeriodMs(void);
 /* USART6 串口测试协议：逐字节接收，命令在 Pitch_Test_Update 中执行。 */
 void Pitch_Test_SerialRxByte(uint8_t byte);
 void Pitch_Test_SerialSendReady(void);
