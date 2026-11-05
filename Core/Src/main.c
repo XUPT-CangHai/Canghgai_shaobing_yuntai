@@ -325,6 +325,8 @@ int main(void)
   Shoot_Test_Init();
   /* CAN1发射与CAN2 Yaw/Pitch共用遥控器，外设由Shoot_Test_Init统一启动�?*/
   Pitch_Test_Init();
+  /* 加热、稳定和陀螺校准结束后通知上位机可以开始 Pitch 串口测试。 */
+  Pitch_Test_SerialSendReady();
   control_tick_ms = HAL_GetTick();
   g_imu_tick_ms = control_tick_ms;
 

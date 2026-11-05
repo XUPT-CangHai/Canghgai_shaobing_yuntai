@@ -2,6 +2,7 @@
 
 #include "stm32f4xx_hal.h"
 #include "usart.h"
+#include "pitch_test.h"
 #include <string.h>
 
 static volatile vision_aim_command_t g_vision_aim;
@@ -111,6 +112,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         uint8_t byte = g_debug_rx_byte;
 
         (void)HAL_UART_Receive_IT(&huart6, &g_debug_rx_byte, 1U);
+        /* USART6 同时承载 Pitch 测试协议；这里只收字节，控制在主循环执行。 */
+        Pitch_Test_SerialRxByte(byte);
         /* 收齐 zimiaokai / zimioaguan 立即生效，有无回车换行均可。 */
         Vision_Aim_ParseCommandByte(byte);
     }

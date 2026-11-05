@@ -1,6 +1,10 @@
 #include "pitch_test.h"
 
+#include <ctype.h>
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "can.h"
 #include "dji_motor.h"
@@ -42,8 +46,29 @@
 /* 浣嶇疆PI锛歅浠?50灏忔鎻愰珮鍒?000锛屽皬绉垎琛ュ伩璐熻浇闈欏樊锛屼笉浣跨敤閫熷害鍐呯幆銆?*/
 #define PITCH_ANGLE_KP          1050.0f
 #define PITCH_ANGLE_KI          65.0f /* 鎸夌绉垎锛?ms涓€娆＄浉褰撲簬姣忔绱姞0.12鍊嶈搴﹁宸€?*/
-#define PITCH_INTEGRAL_LIMIT    1500.0f /* 绉垎鍗曠嫭闄愬箙锛岄伩鍏嶅彈闃绘椂涓嶆柇绱Н銆?*/
+#define PITCH_INTEGRAL_LIMIT    500.0f /* 加入前馈后，积分只修正剩余静差。 */ /* 绉垎鍗曠嫭闄愬箙锛岄伩鍏嶅彈闃绘椂涓嶆柇绱Н銆?*/
 #define PITCH_CURRENT_LIMIT     16000.0f
+#define PITCH_SERIAL_LINE_MAX   64U
+
+/* Pitch 重力/摩擦补偿首版，表值单位为 6020 发送电流。 */
+#define PITCH_GRAVITY_FF_SCALE   0.30f
+#define PITCH_FRICTION_FF        180.0f
+#define PITCH_FRICTION_SPEED_RPM 30
+#define PITCH_STATIC_FRICTION_ERROR_DEG 0.5f
+#define PITCH_CASCADE_ANGLE_KP  10.0f
+#define PITCH_CASCADE_MAX_RPM    300.0f
+#define PITCH_CASCADE_SPEED_KP  80.0f
+#define PITCH_CASCADE_SPEED_KI  8.0f
+#define PITCH_CASCADE_SPEED_MAX_I 2000.0f
+#define PITCH_SPEED_FEEDBACK_DIRECTION (-1.0f)
+
+static const float g_pitch_gravity_angle[] =
+    {30.0f, 35.0f, 40.0f, 45.0f, 50.0f, 55.0f, 60.0f, 65.0f, 70.0f};
+static const float g_pitch_gravity_current[] =
+    {2643.0f, 2288.0f, 2368.0f, 2717.0f, 2562.0f,
+     2730.0f, 2446.0f, 3003.0f, 2681.0f};
+static float g_pitch_gravity_ff;
+static float g_pitch_friction_ff;
 
 static dji_6020_feedback_t g_pitch_feedback;
 static float g_pitch_target_angle;
@@ -56,7 +81,15 @@ static int16_t g_pitch_debug_channel;
 static int16_t g_pitch_debug_current;
 static float g_pitch_debug_error;
 static float g_pitch_integral;
+static int16_t g_pitch_debug_target_rpm;
 static uint32_t g_pitch_can_tx_fail;
+static uint8_t g_pitch_serial_mode;
+static float g_pitch_serial_target_angle;
+static uint8_t g_pitch_serial_status_request;
+static volatile uint8_t g_pitch_serial_rx_length;
+static volatile uint8_t g_pitch_serial_line_ready;
+static volatile char g_pitch_serial_rx_line[PITCH_SERIAL_LINE_MAX];
+static volatile char g_pitch_serial_pending_line[PITCH_SERIAL_LINE_MAX];
 
 typedef struct
 {
@@ -69,6 +102,10 @@ typedef struct
     float iout;
     float out;
 } yaw_legacy_pid_t;
+
+static yaw_legacy_pid_t g_pitch_angle_pid;
+static yaw_legacy_pid_t g_pitch_speed_pid;
+static void Yaw_LegacyPid_Clear(yaw_legacy_pid_t *pid);
 
 enum
 {
@@ -108,6 +145,59 @@ static float Pitch_Test_Clamp(float value, float limit)
         return -limit;
     }
     return value;
+}
+
+static float Pitch_Test_GravityFeedforward(float angle)
+{
+    uint32_t i;
+    const uint32_t count =
+        (uint32_t)(sizeof(g_pitch_gravity_angle) /
+                   sizeof(g_pitch_gravity_angle[0]));
+
+    if (angle <= g_pitch_gravity_angle[0])
+    {
+        return g_pitch_gravity_current[0] * PITCH_GRAVITY_FF_SCALE;
+    }
+    if (angle >= g_pitch_gravity_angle[count - 1U])
+    {
+        return g_pitch_gravity_current[count - 1U] *
+               PITCH_GRAVITY_FF_SCALE;
+    }
+    for (i = 1U; i < count; i++)
+    {
+        if (angle <= g_pitch_gravity_angle[i])
+        {
+            float a0 = g_pitch_gravity_angle[i - 1U];
+            float a1 = g_pitch_gravity_angle[i];
+            float c0 = g_pitch_gravity_current[i - 1U];
+            float c1 = g_pitch_gravity_current[i];
+            float ratio = (angle - a0) / (a1 - a0);
+            return (c0 + (c1 - c0) * ratio) * PITCH_GRAVITY_FF_SCALE;
+        }
+    }
+    return 0.0f;
+}
+
+static float Pitch_Test_FrictionFeedforward(int16_t speed_rpm,
+                                            float angle_error)
+{
+    if (speed_rpm > PITCH_FRICTION_SPEED_RPM)
+    {
+        return PITCH_FRICTION_FF;
+    }
+    if (speed_rpm < -PITCH_FRICTION_SPEED_RPM)
+    {
+        return -PITCH_FRICTION_FF;
+    }
+    if (angle_error > PITCH_STATIC_FRICTION_ERROR_DEG)
+    {
+        return PITCH_FRICTION_FF;
+    }
+    if (angle_error < -PITCH_STATIC_FRICTION_ERROR_DEG)
+    {
+        return -PITCH_FRICTION_FF;
+    }
+    return 0.0f;
 }
 
 static void Yaw_LegacyPid_Init(yaw_legacy_pid_t *pid,
@@ -170,6 +260,19 @@ static float Yaw_LegacyPid_Delta(yaw_legacy_pid_t *pid,
     return pid->out;
 }
 
+/* Pitch 速度内环使用位置式 PI，避免增量式 PID 在反馈换向时反冲。 */
+static float Pitch_SpeedPid_Position(yaw_legacy_pid_t *pid,
+                                     float target,
+                                     float feedback)
+{
+    float error = target - feedback;
+
+    pid->iout += pid->ki * error * PITCH_CONTROL_PERIOD_S;
+    pid->iout = Pitch_Test_Clamp(pid->iout, pid->max_iout);
+    pid->out = pid->kp * error + pid->iout;
+    return Pitch_Test_Clamp(pid->out, pid->max_out);
+}
+
 static float Pitch_Test_GetAngle(const dji_6020_feedback_t *feedback)
 {
     return ((float)feedback->ecd * 360.0f) / 8192.0f;
@@ -214,6 +317,183 @@ static float Yaw_ShortestError(float target, float current)
         error += 360.0f;
     }
     return error;
+}
+
+static void Pitch_Test_SerialSend(const char *text)
+{
+    static char tx_buffer[160];
+    size_t length;
+
+    if ((text == NULL) || (huart6.gState != HAL_UART_STATE_READY))
+    {
+        return;
+    }
+    length = strlen(text);
+    if ((length == 0U) || (length >= sizeof(tx_buffer)))
+    {
+        return;
+    }
+    memcpy(tx_buffer, text, length + 1U);
+    (void)HAL_UART_Transmit_DMA(&huart6, (uint8_t *)tx_buffer,
+                                (uint16_t)length);
+}
+
+static uint8_t Pitch_Test_SerialParseFloat(const char *text, float *value)
+{
+    char *end;
+    float parsed;
+
+    if ((text == NULL) || (value == NULL))
+    {
+        return 0U;
+    }
+    parsed = strtof(text, &end);
+    while (isspace((unsigned char)*end) != 0)
+    {
+        end++;
+    }
+    if ((end == text) || (*end != '\0') || !isfinite(parsed))
+    {
+        return 0U;
+    }
+    *value = parsed;
+    return 1U;
+}
+
+static void Pitch_Test_SerialProcess(float current_angle)
+{
+    char line[PITCH_SERIAL_LINE_MAX];
+    char *argument;
+    float target_angle;
+    uint32_t primask;
+    uint8_t i;
+
+    if (g_pitch_serial_line_ready == 0U)
+    {
+        return;
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    memcpy(line, (const void *)g_pitch_serial_pending_line, sizeof(line));
+    g_pitch_serial_line_ready = 0U;
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+
+    for (i = 0U; i < (uint8_t)(sizeof(line) - 1U); i++)
+    {
+        if (line[i] == '\0')
+        {
+            break;
+        }
+        line[i] = (char)toupper((unsigned char)line[i]);
+    }
+    line[sizeof(line) - 1U] = '\0';
+
+    if (strcmp(line, "PIT STOP") == 0)
+    {
+        g_pitch_serial_mode = 0U;
+        g_pitch_serial_status_request = 0U;
+        g_pitch_target_initialized = 0U;
+        g_pitch_integral = 0.0f;
+        Yaw_LegacyPid_Clear(&g_pitch_angle_pid);
+        Yaw_LegacyPid_Clear(&g_pitch_speed_pid);
+        Pitch_Test_SerialSend("ACK PIT STOP\r\n");
+        return;
+    }
+    if (strcmp(line, "PIT HOLD") == 0)
+    {
+        g_pitch_serial_mode = 1U;
+        g_pitch_serial_target_angle = Pitch_Test_ClampAngle(current_angle);
+        g_pitch_target_initialized = 1U;
+        g_pitch_integral = 0.0f;
+        Yaw_LegacyPid_Clear(&g_pitch_angle_pid);
+        Yaw_LegacyPid_Clear(&g_pitch_speed_pid);
+        Pitch_Test_SerialSend("ACK PIT HOLD\r\n");
+        return;
+    }
+    if ((strcmp(line, "PIT GET") == 0) ||
+        (strcmp(line, "PIT STATUS") == 0))
+    {
+        g_pitch_serial_status_request = 1U;
+        return;
+    }
+    if (strcmp(line, "PIT HELP") == 0)
+    {
+        Pitch_Test_SerialSend(
+            "CMD PIT SET <deg>|HOLD|GET|STATUS|STOP|HELP deg=26..80\r\n");
+        return;
+    }
+    if (strncmp(line, "PIT SET ", 8U) == 0)
+    {
+        argument = &line[8];
+        if (!Pitch_Test_SerialParseFloat(argument, &target_angle))
+        {
+            Pitch_Test_SerialSend("ERR PIT SET angle\r\n");
+            return;
+        }
+        if ((target_angle < PITCH_ANGLE_MIN_DEG) ||
+            (target_angle > PITCH_ANGLE_MAX_DEG))
+        {
+            Pitch_Test_SerialSend("ERR PIT SET range=26..80\r\n");
+            return;
+        }
+        g_pitch_serial_mode = 1U;
+        g_pitch_serial_target_angle = target_angle;
+        g_pitch_target_initialized = 1U;
+        g_pitch_integral = 0.0f;
+        Yaw_LegacyPid_Clear(&g_pitch_angle_pid);
+        Yaw_LegacyPid_Clear(&g_pitch_speed_pid);
+        Pitch_Test_SerialSend("ACK PIT SET\r\n");
+        return;
+    }
+
+    Pitch_Test_SerialSend("ERR PIT CMD\r\n");
+}
+
+void Pitch_Test_SerialRxByte(uint8_t byte)
+{
+    uint8_t length;
+
+    if ((byte == '\r') || (byte == '\n'))
+    {
+        length = g_pitch_serial_rx_length;
+        if ((length != 0U) && (g_pitch_serial_line_ready == 0U))
+        {
+            memcpy((void *)g_pitch_serial_pending_line,
+                   (const void *)g_pitch_serial_rx_line, length);
+            g_pitch_serial_pending_line[length] = '\0';
+            g_pitch_serial_line_ready = 1U;
+        }
+        g_pitch_serial_rx_length = 0U;
+        return;
+    }
+    if ((byte < 0x20U) || (byte >= 0x7FU))
+    {
+        g_pitch_serial_rx_length = 0U;
+        return;
+    }
+    if (g_pitch_serial_line_ready != 0U)
+    {
+        return;
+    }
+    length = g_pitch_serial_rx_length;
+    if (length < (uint8_t)(PITCH_SERIAL_LINE_MAX - 1U))
+    {
+        g_pitch_serial_rx_line[length] = (char)byte;
+        g_pitch_serial_rx_length = (uint8_t)(length + 1U);
+    }
+    else
+    {
+        g_pitch_serial_rx_length = 0U;
+    }
+}
+
+void Pitch_Test_SerialSendReady(void)
+{
+    Pitch_Test_SerialSend("SYS:READY PIT_PROTO=1\r\n");
 }
 
 static uint8_t Pitch_Test_AimIsActive(const vision_aim_command_t *aim,
@@ -351,8 +631,19 @@ void Pitch_Test_Init(void)
     g_pitch_debug_channel = 0;
     g_pitch_debug_current = 0;
     g_pitch_debug_error = 0.0f;
+    g_pitch_debug_target_rpm = 0;
     g_pitch_integral = 0.0f;
+    g_pitch_gravity_ff = 0.0f;
+    g_pitch_friction_ff = 0.0f;
     g_pitch_can_tx_fail = 0U;
+    g_pitch_serial_mode = 0U;
+    g_pitch_serial_target_angle = 0.0f;
+    g_pitch_serial_status_request = 0U;
+    g_pitch_serial_rx_length = 0U;
+    g_pitch_serial_line_ready = 0U;
+    memset((void *)g_pitch_serial_rx_line, 0, sizeof(g_pitch_serial_rx_line));
+    memset((void *)g_pitch_serial_pending_line, 0,
+           sizeof(g_pitch_serial_pending_line));
     g_yaw_target_initialized = 0U;
     g_yaw_mode = YAW_MODE_DISABLED;
     g_aim_yaw_applied_frame_count = 0U;
@@ -363,6 +654,11 @@ void Pitch_Test_Init(void)
                        0.0f, YAW_ANGLE_MAX_RPM);
     Yaw_LegacyPid_Init(&g_yaw_speed_pid, YAW_SPEED_KP, YAW_SPEED_KI, 0.0f,
                        YAW_SPEED_MAX_I, YAW_CURRENT_LIMIT);
+    Yaw_LegacyPid_Init(&g_pitch_angle_pid, PITCH_CASCADE_ANGLE_KP, 0.0f,
+                       0.0f, 0.0f, PITCH_CASCADE_MAX_RPM);
+    Yaw_LegacyPid_Init(&g_pitch_speed_pid, PITCH_CASCADE_SPEED_KP,
+                       PITCH_CASCADE_SPEED_KI, 0.0f,
+                       PITCH_CASCADE_SPEED_MAX_I, PITCH_CURRENT_LIMIT);
 
     /* 鏈ā鍧楀彧鎺у埗CAN2鐨?020锛孋AN1鍙戝皠鐢眘hoot_test缁熶竴鎺у埗銆?*/
     (void)DJI_6020_SendCurrent(&hcan2, 0, 0, 0, 0);
@@ -380,6 +676,7 @@ void Pitch_Test_Update(void)
     int16_t yaw_current;
     int16_t rc_input;
     uint8_t aim_active;
+    uint8_t pitch_control_enabled = 0U;
 
     Remote_Control_Get(&remote);
     Vision_Aim_Service();
@@ -393,6 +690,7 @@ void Pitch_Test_Update(void)
                                              now_ms,
                                              PITCH_MOTOR_TIMEOUT_MS);
     current_angle = Pitch_Test_GetAngle(&g_pitch_feedback);
+    Pitch_Test_SerialProcess(current_angle);
     g_pitch_debug_channel = remote.channel[1];
     g_pitch_debug_error = 0.0f;
     aim_active = Pitch_Test_AimIsActive(&aim, now_ms);
@@ -405,27 +703,55 @@ void Pitch_Test_Update(void)
         g_pitch_target_initialized = 0U;
         g_yaw_target_initialized = 0U;
         g_pitch_integral = 0.0f;
+        Yaw_LegacyPid_Clear(&g_pitch_angle_pid);
+        Yaw_LegacyPid_Clear(&g_pitch_speed_pid);
         Yaw_LegacyPid_Clear(&g_yaw_angle_pid);
         Yaw_LegacyPid_Clear(&g_yaw_speed_pid);
     }
 
     /* 鑷瀯鐢?USART6 鐙珛浣胯兘锛涘彧鏈夋墜鍔ㄦā寮忚姹傞仴鎺у湪绾夸笖宸﹀紑鍏崇疆涓€?*/
     if ((g_pitch_motor_online == 0U) ||
-        ((aim.aim_enabled != 0U) && (aim_active == 0U)) ||
-        ((aim.aim_enabled == 0U) &&
-         ((g_pitch_remote_online == 0U) ||
-          (g_pitch_remote_valid == 0U) ||
-          (remote.switch_position[RC_S_LEFT] != RC_SW_MID))))
+        ((g_pitch_serial_mode == 0U) &&
+         (((aim.aim_enabled != 0U) && (aim_active == 0U)) ||
+          ((aim.aim_enabled == 0U) &&
+           ((g_pitch_remote_online == 0U) ||
+            (g_pitch_remote_valid == 0U) ||
+            (remote.switch_position[RC_S_LEFT] != RC_SW_MID))))))
     {
         g_pitch_target_initialized = 0U;
         g_aim_pitch_applied_frame_count = 0U;
+        g_pitch_debug_target_rpm = 0;
         /* 澶辫兘娓呯Н鍒嗭紝閲嶆柊鍚敤鏃朵笉甯﹀叆涓婃琛ュ伩銆?*/
         g_pitch_integral = 0.0f;
+        Yaw_LegacyPid_Clear(&g_pitch_angle_pid);
+        Yaw_LegacyPid_Clear(&g_pitch_speed_pid);
         /* 澶辫兘鏃舵樉绀哄綋鍓嶄綅缃紱涓嬫浣胯兘閲嶆柊閽充綅锛屼笉杩借刀鏃х洰鏍囥€?*/
         g_pitch_target_angle = current_angle;
     }
+    else if (g_pitch_serial_mode != 0U)
+    {
+        float target_rpm;
+
+        pitch_control_enabled = 1U;
+        g_pitch_target_initialized = 1U;
+        g_pitch_target_angle = Pitch_Test_ClampAngle(g_pitch_serial_target_angle);
+        angle_error = g_pitch_target_angle - current_angle;
+        g_pitch_debug_error = angle_error;
+        target_rpm = Yaw_LegacyPid_Position(&g_pitch_angle_pid, angle_error);
+        g_pitch_debug_target_rpm = (int16_t)target_rpm;
+        current_request = Pitch_SpeedPid_Position(
+            &g_pitch_speed_pid, target_rpm,
+            (float)g_pitch_feedback.speed_rpm *
+                PITCH_SPEED_FEEDBACK_DIRECTION);
+        pitch_current = (int16_t)Pitch_Test_Clamp(
+            current_request * PITCH_MOTOR_DIRECTION,
+            PITCH_CURRENT_LIMIT);
+    }
     else if (aim_active != 0U)
     {
+        float target_rpm;
+
+        pitch_control_enabled = 1U;
         g_pitch_target_initialized = 1U;
         if (g_aim_pitch_applied_frame_count != aim.new_frame_count)
         {
@@ -437,12 +763,19 @@ void Pitch_Test_Update(void)
         angle_error = Pitch_Test_Clamp(
             g_pitch_target_angle - current_angle, AIM_PITCH_ERROR_MAX_DEG);
         g_pitch_debug_error = angle_error;
-        current_request = angle_error * PITCH_ANGLE_KP;
+        target_rpm = Yaw_LegacyPid_Position(&g_pitch_angle_pid, angle_error);
+        g_pitch_debug_target_rpm = (int16_t)target_rpm;
+        current_request = Pitch_SpeedPid_Position(
+            &g_pitch_speed_pid, target_rpm,
+            (float)g_pitch_feedback.speed_rpm *
+                PITCH_SPEED_FEEDBACK_DIRECTION);
         pitch_current = (int16_t)Pitch_Test_Clamp(
             current_request * PITCH_MOTOR_DIRECTION, PITCH_CURRENT_LIMIT);
     }
     else
     {
+        g_pitch_debug_target_rpm = 0;
+        pitch_control_enabled = 1U;
         if (g_pitch_target_initialized == 0U)
         {
             g_pitch_target_angle = Pitch_Test_ClampAngle(current_angle);
@@ -479,12 +812,34 @@ void Pitch_Test_Update(void)
             PITCH_CURRENT_LIMIT);
     }
 
+    if (pitch_control_enabled != 0U)
+    {
+        g_pitch_gravity_ff = Pitch_Test_GravityFeedforward(current_angle);
+        g_pitch_friction_ff = Pitch_Test_FrictionFeedforward(
+            (int16_t)((float)g_pitch_feedback.speed_rpm *
+                      PITCH_SPEED_FEEDBACK_DIRECTION),
+            g_pitch_debug_error);
+        pitch_current = (int16_t)Pitch_Test_Clamp(
+            (float)pitch_current + g_pitch_gravity_ff + g_pitch_friction_ff,
+            PITCH_CURRENT_LIMIT);
+    }
+    else
+    {
+        g_pitch_gravity_ff = 0.0f;
+        g_pitch_friction_ff = 0.0f;
+    }
+
     yaw_current = Yaw_Update(&remote, &aim, aim_active, now_ms);
     g_pitch_debug_current = pitch_current;
     /* CAN2缁熶竴鍙戦€侊細ID1鍥哄畾闆剁數娴併€両D2 Yaw銆両D3 Pitch銆?*/
     if (DJI_6020_SendCurrent(&hcan2, 0, yaw_current, pitch_current, 0) != HAL_OK)
     {
         g_pitch_can_tx_fail++;
+    }
+    if (g_pitch_serial_status_request != 0U)
+    {
+        g_pitch_serial_status_request = 0U;
+        Pitch_Test_DebugPrint();
     }
 }
 
@@ -517,12 +872,14 @@ void Pitch_Test_DebugPrint(void)
 
     /* USART6 每秒输出一次完整 Pitch 快照，用于重力补偿测量。 */
     length = snprintf(message, sizeof(message),
-                      "PIT:on=%u rc=%u/%u sw=%u ch=%d "
+                      "PIT:on=%u serial=%u rc=%u/%u sw=%u ch=%d "
                       "init=%u ecd=%u last=%u a=%.2f t=%.2f e=%.2f "
-                      "rpm=%d cmd=%d fbI=%d temp=%u int=%.1f lim=%d txfail=%lu "
+                      "rpm=%d prpm=%d cmd=%d fbI=%d temp=%u int=%.1f "
+                      "gff=%.0f fff=%.0f lim=%d txfail=%lu "
                       "AIM:en=%u active=%u valid=%u fresh=%u perr=%.2f seq=%u age=%lu\r\n",
                       (unsigned int)DJI_6020_IsOnline(PITCH_MOTOR_INDEX, now_ms,
                                                      PITCH_MOTOR_TIMEOUT_MS),
+                      (unsigned int)g_pitch_serial_mode,
                       (unsigned int)g_pitch_remote_online,
                       (unsigned int)g_pitch_remote_valid,
                       (unsigned int)remote.switch_position[RC_S_LEFT],
@@ -534,10 +891,13 @@ void Pitch_Test_DebugPrint(void)
                       (double)g_pitch_target_angle,
                       (double)g_pitch_debug_error,
                       (int)pitch_feedback.speed_rpm,
+                      (int)g_pitch_debug_target_rpm,
                       (int)g_pitch_debug_current,
                       (int)pitch_feedback.given_current,
                       (unsigned int)pitch_feedback.temperature,
                       (double)g_pitch_integral,
+                      (double)g_pitch_gravity_ff,
+                      (double)g_pitch_friction_ff,
                       pitch_limit,
                       (unsigned long)g_pitch_can_tx_fail,
                       (unsigned int)aim.aim_enabled,
