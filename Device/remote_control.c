@@ -1,6 +1,7 @@
 #include "remote_control.h"
 #include "bsp_remote.h"
 
+#include <math.h>
 #include <string.h>
 
 #define RC_FRAME_LENGTH                 18U
@@ -11,8 +12,11 @@
 /* 旧工程USART1遥控转发协议：0xA6 + 18字节DBUS + 8位累加和。 */
 #define RC_FORWARD_HEADER               0xA6U
 #define RC_FORWARD_FRAME_LENGTH        20U
-#define RC_FORWARD_DMA_BUFFER_LENGTH   40U
+/* 修改：接收块大于A6+A5的40字节，避免满块自动切换后IDLE读到零长度。 */
+#define RC_FORWARD_DMA_BUFFER_LENGTH   80U
 #define RC_SOURCE_SELECT_TIMEOUT_MS   200U
+#define RC_CHASSIS_STATUS_HEADER       0xA5U
+#define RC_CHASSIS_STATUS_FRAME_LENGTH 20U
 
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart3;
@@ -23,6 +27,7 @@ static uint8_t g_direct_rx_buffer[2][RC_DMA_BUFFER_LENGTH];
 static uint8_t g_forward_rx_buffer[2][RC_FORWARD_DMA_BUFFER_LENGTH];
 static volatile remote_control_t g_direct_remote;
 static volatile remote_control_t g_forward_remote;
+static volatile remote_chassis_status_t g_chassis_status;
 static volatile uint8_t g_remote_source = RC_SOURCE_NONE;
 
 static uint8_t g_forward_parse_buffer[RC_FORWARD_FRAME_LENGTH];
@@ -57,10 +62,49 @@ static void Remote_Control_Decode(const uint8_t data[RC_FRAME_LENGTH],
     *target = decoded;
 }
 
+static uint8_t Remote_Control_FrameValid(const uint8_t frame[RC_FORWARD_FRAME_LENGTH],
+                                         uint8_t header)
+{
+    uint8_t checksum = 0U;
+    uint8_t i;
+
+    if ((frame == NULL) || (frame[0] != header))
+    {
+        return 0U;
+    }
+    for (i = 0U; i < (RC_FORWARD_FRAME_LENGTH - 1U); i++)
+    {
+        checksum = (uint8_t)(checksum + frame[i]);
+    }
+    return (uint8_t)(checksum == frame[RC_FORWARD_FRAME_LENGTH - 1U]);
+}
+
+static void Remote_Control_ParseChassisStatus(
+    const uint8_t frame[RC_CHASSIS_STATUS_FRAME_LENGTH])
+{
+    float speed_rpm;
+
+    if ((frame == NULL) ||
+        (Remote_Control_FrameValid(frame, RC_CHASSIS_STATUS_HEADER) == 0U))
+    {
+        return;
+    }
+
+    memcpy(&speed_rpm, &frame[1], sizeof(speed_rpm));
+    if (!isfinite(speed_rpm))
+    {
+        return;
+    }
+    g_chassis_status.chassis_z_speed_rpm = speed_rpm;
+    g_chassis_status.small_gyro_enable = (frame[9] != 0U) ? 1U : 0U;
+    g_chassis_status.update_tick_ms = HAL_GetTick();
+}
+
 void Remote_Control_Init(void)
 {
     memset((void *)&g_direct_remote, 0, sizeof(g_direct_remote));
     memset((void *)&g_forward_remote, 0, sizeof(g_forward_remote));
+    memset((void *)&g_chassis_status, 0, sizeof(g_chassis_status));
     memset(g_forward_parse_buffer, 0, sizeof(g_forward_parse_buffer));
     g_forward_parse_length = 0U;
     g_remote_source = RC_SOURCE_NONE;
@@ -115,24 +159,6 @@ void Remote_Control_UART_IRQHandler(void)
     }
 }
 
-static uint8_t Remote_Control_ForwardFrameValid(
-    const uint8_t frame[RC_FORWARD_FRAME_LENGTH])
-{
-    uint8_t checksum = 0U;
-    uint8_t i;
-
-    if ((frame == NULL) || (frame[0] != RC_FORWARD_HEADER))
-    {
-        return 0U;
-    }
-
-    for (i = 0U; i < (RC_FORWARD_FRAME_LENGTH - 1U); i++)
-    {
-        checksum = (uint8_t)(checksum + frame[i]);
-    }
-    return (uint8_t)(checksum == frame[RC_FORWARD_FRAME_LENGTH - 1U]);
-}
-
 static void Remote_Control_ForwardParse(const uint8_t *data, uint16_t length)
 {
     uint16_t i;
@@ -148,7 +174,8 @@ static void Remote_Control_ForwardParse(const uint8_t *data, uint16_t length)
 
         if (g_forward_parse_length == 0U)
         {
-            if (byte == RC_FORWARD_HEADER)
+            if ((byte == RC_FORWARD_HEADER) ||
+                (byte == RC_CHASSIS_STATUS_HEADER))
             {
                 g_forward_parse_buffer[0] = byte;
                 g_forward_parse_length = 1U;
@@ -161,16 +188,24 @@ static void Remote_Control_ForwardParse(const uint8_t *data, uint16_t length)
 
         if (g_forward_parse_length >= RC_FORWARD_FRAME_LENGTH)
         {
-            if (Remote_Control_ForwardFrameValid(g_forward_parse_buffer) != 0U)
+            if (Remote_Control_FrameValid(g_forward_parse_buffer,
+                                          RC_FORWARD_HEADER) != 0U)
             {
                 Remote_Control_Decode(&g_forward_parse_buffer[1],
                                       &g_forward_remote);
                 g_forward_parse_length = 0U;
             }
+            else if (Remote_Control_FrameValid(g_forward_parse_buffer,
+                                               RC_CHASSIS_STATUS_HEADER) != 0U)
+            {
+                Remote_Control_ParseChassisStatus(g_forward_parse_buffer);
+                g_forward_parse_length = 0U;
+            }
             else
             {
                 /* 校验失败时保留当前字节作为下一帧帧头候选。 */
-                if (byte == RC_FORWARD_HEADER)
+                if ((byte == RC_FORWARD_HEADER) ||
+                    (byte == RC_CHASSIS_STATUS_HEADER))
                 {
                     g_forward_parse_buffer[0] = byte;
                     g_forward_parse_length = 1U;
@@ -298,6 +333,33 @@ void Remote_Control_Get(remote_control_t *remote)
     }
 
     (void)Remote_Control_Select(remote);
+}
+
+void Remote_Control_GetChassisStatus(remote_chassis_status_t *status)
+{
+    uint32_t primask;
+
+    if (status == NULL)
+    {
+        return;
+    }
+    primask = __get_PRIMASK();
+    __disable_irq();
+    *status = g_chassis_status;
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+}
+
+uint8_t Remote_Control_ChassisStatusValid(uint32_t now_ms,
+                                          uint32_t timeout_ms)
+{
+    remote_chassis_status_t status = {0};
+
+    Remote_Control_GetChassisStatus(&status);
+    return (uint8_t)((status.update_tick_ms != 0U) &&
+                     ((uint32_t)(now_ms - status.update_tick_ms) <= timeout_ms));
 }
 
 uint8_t Remote_Control_IsOnline(uint32_t now_ms, uint32_t timeout_ms)

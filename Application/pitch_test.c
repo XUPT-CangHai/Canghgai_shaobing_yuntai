@@ -8,13 +8,31 @@
 
 #include "can.h"
 #include "dji_motor.h"
+#include "imu_system.h"
 #include "pid.h"
 #include "remote_control.h"
 #include "vision_aim.h"
 #include "usart.h"
 
 /* ID2 Yaw锛氳縼绉绘棫宸ョ▼鐨勨€滄墜鍔ㄨ窡闅?+ 鏉炬潌浣嶇疆淇濇寔鈥濅覆绾ф帶鍒躲€?*/
-#define YAW_MOTOR_INDEX         1U       /* 6020 ID2锛屽弽棣堝抚 0x206銆?*/
+#define BIG_YAW_MOTOR_INDEX     0U       /* 6020 ID1，大 Yaw，反馈帧 0x205。 */
+#define YAW_MOTOR_INDEX         1U       /* 6020 ID2，小 Yaw，反馈帧 0x206。 */
+#define BIG_YAW_STATUS_TIMEOUT_MS 120U
+#define BIG_YAW_SPEED_MAX_RPM   300.0f
+/* 修改：正反转实测保留300/0.7，400/1.0出现反馈尖峰和输出饱和。 */
+#define BIG_YAW_SPEED_KP         300.0f
+#define BIG_YAW_SPEED_KI         0.70f
+#define BIG_YAW_SPEED_MAX_I      300.0f
+#define BIG_YAW_CURRENT_LIMIT    16000.0f
+/* 修改：ID1专用串口快照为50ms，观察转速误差和云台朝向。 */
+#define BIG_YAW_DEBUG_PERIOD_MS  50U
+/* A5逆时针为正，ID1目标取反；补偿物理方向已经现场确认。 */
+#define BIG_YAW_COMPENSATION_SIGN (-1.0f)
+/* 修改：朝向外环输出单位rpm；实测后上电启用，运行仍由底盘A5/拨杆门控。 */
+#define BIG_YAW_HOLD_ANGLE_KP    0.05f  /* rpm/deg。 */
+#define BIG_YAW_HOLD_ANGLE_KI    0.003f /* rpm/(deg*s)。 */
+#define BIG_YAW_HOLD_TRIM_MAX_RPM 3.0f
+#define BIG_YAW_HOLD_MAX_RPM     10.0f
 #define YAW_RC_DEADZONE         10
 #define YAW_RC_DIRECTION       -1.0f
 #define YAW_RC_MAX_SPEED_DEG_S  55.0f
@@ -24,6 +42,7 @@
 #define YAW_SPEED_KI             0.35f
 #define YAW_SPEED_MAX_I          300.0f
 #define YAW_CURRENT_LIMIT        16000.0f
+/* 修改：2026-11-06现场确认ID2小Yaw机械中位ecd=3627，绝对编码器角159.39度。 */
 #define YAW_ANGLE_MIN_DEG        125.0f
 #define YAW_ANGLE_MAX_DEG        212.0f
 #define AIM_YAW_ERROR_MAX_DEG    45.0f
@@ -46,6 +65,7 @@
 #define PITCH_RC_DIRECTION      -1.0f
 #define PITCH_MOTOR_DIRECTION    1.0f
 /* CAN2 ID3缂栫爜鍣ㄧ粷瀵硅锛氱洰鏍囪蒋闄愪綅26~80搴︼紝澶辫兘鍚庝粛涓洪浂杈撳嚭銆?*/
+/* 修改：主人此前确认的Pitch水平中位ecd=1191，绝对编码器角52.34度。 */
 #define PITCH_ANGLE_MIN_DEG     26.0f
 #define PITCH_ANGLE_MAX_DEG     80.0f
 
@@ -126,6 +146,26 @@ static uint8_t g_yaw_mode = YAW_MODE_DISABLED;
 static float g_yaw_target_angle;
 static yaw_legacy_pid_t g_yaw_angle_pid;
 static yaw_legacy_pid_t g_yaw_speed_pid;
+static yaw_legacy_pid_t g_big_yaw_speed_pid;
+static uint8_t g_big_yaw_enabled;
+/* 修改：保留小数目标速度，避免低速跟随误差被整数快照隐藏。 */
+static float g_big_yaw_debug_target_rpm;
+static int16_t g_big_yaw_debug_speed_rpm;
+static int16_t g_big_yaw_debug_current;
+static uint8_t g_big_yaw_debug_enabled;
+/* 修改：记录补偿运行中因通信/电机超时撤力的次数，右中正常停止不计数。 */
+static uint32_t g_big_yaw_drop_count;
+static uint8_t g_big_yaw_hold_enabled;
+static uint8_t g_big_yaw_hold_initialized;
+static uint8_t g_big_yaw_hold_valid;
+static float g_big_yaw_small_yaw_sign;
+static float g_big_yaw_hold_kp;
+static float g_big_yaw_hold_ki;
+static float g_big_yaw_hold_heading;
+static float g_big_yaw_hold_target;
+static float g_big_yaw_hold_error;
+static float g_big_yaw_hold_trim;
+static float g_big_yaw_hold_correction;
 
 /* 视觉与串口阶跃共用此组 PID；遥控器保留原来的参数。 */
 static yaw_legacy_pid_t g_yaw_aim_speed_pid;
@@ -350,6 +390,15 @@ static float Yaw_ShortestError(float target, float current)
     return error;
 }
 
+/* 修改：只清朝向外环，保留正在运行的速度PI，避免切换外环时撤力。 */
+static void Big_Yaw_ClearHold(void)
+{
+    g_big_yaw_hold_initialized = 0U;
+    g_big_yaw_hold_error = 0.0f;
+    g_big_yaw_hold_trim = 0.0f;
+    g_big_yaw_hold_correction = 0.0f;
+}
+
 static void Pitch_Test_SerialSend(const char *text)
 {
     static char tx_buffer[160];
@@ -422,6 +471,104 @@ static void Pitch_Test_SerialProcess(float current_angle)
         line[i] = (char)toupper((unsigned char)line[i]);
     }
     line[sizeof(line) - 1U] = '\0';
+
+    /* 修改：BY命令仅采集/调整ID1速度PID，启停仍由底盘拨杆和A5决定。 */
+    if (strcmp(line, "BY GET") == 0)
+    {
+        g_big_yaw_debug_enabled = 1U;
+        g_pitch_serial_status_request = 1U;
+        return;
+    }
+    if (strcmp(line, "BY LOG 0") == 0)
+    {
+        g_big_yaw_debug_enabled = 0U;
+        Pitch_Test_SerialSend("ACK BY LOG 0\r\n");
+        return;
+    }
+    /* 修改：先确认ID2转角符号，再启用朝向外环；BY命令仍不独立启动ID1。 */
+    if ((strcmp(line, "BY HOLD 0") == 0) ||
+        (strcmp(line, "BY HOLD 1") == 0))
+    {
+        if ((line[8] == '1') && (g_big_yaw_hold_valid == 0U))
+        {
+            Pitch_Test_SerialSend("ERR BY HOLD sensor\r\n");
+            return;
+        }
+        g_big_yaw_hold_enabled = (uint8_t)(line[8] == '1');
+        Big_Yaw_ClearHold();
+        g_big_yaw_debug_enabled = 1U;
+        Pitch_Test_SerialSend("ACK BY HOLD\r\n");
+        return;
+    }
+    if (strncmp(line, "BY SIGN ", 8U) == 0)
+    {
+        float sign;
+
+        if ((g_big_yaw_hold_enabled != 0U) ||
+            !Pitch_Test_SerialParseFloat(&line[8], &sign) ||
+            ((sign != 1.0f) && (sign != -1.0f)))
+        {
+            Pitch_Test_SerialSend("ERR BY SIGN hold_off_then_1_or_-1\r\n");
+            return;
+        }
+        g_big_yaw_small_yaw_sign = sign;
+        Big_Yaw_ClearHold();
+        g_big_yaw_debug_enabled = 1U;
+        Pitch_Test_SerialSend("ACK BY SIGN\r\n");
+        return;
+    }
+    if ((strncmp(line, "BY HKP ", 7U) == 0) ||
+        (strncmp(line, "BY HKI ", 7U) == 0))
+    {
+        float gain;
+        uint8_t is_integral = (uint8_t)(line[5] == 'I');
+
+        if (!Pitch_Test_SerialParseFloat(&line[7], &gain) ||
+            (gain < 0.0f) || (gain > (is_integral ? 0.05f : 0.5f)))
+        {
+            Pitch_Test_SerialSend("ERR BY HOLD gain_range\r\n");
+            return;
+        }
+        if (is_integral != 0U)
+        {
+            g_big_yaw_hold_ki = gain;
+        }
+        else
+        {
+            g_big_yaw_hold_kp = gain;
+        }
+        /* 调参后重新锚定当前朝向；现场调参应先右中停稳。 */
+        Big_Yaw_ClearHold();
+        g_big_yaw_debug_enabled = 1U;
+        Pitch_Test_SerialSend("ACK BY HOLD GAIN\r\n");
+        return;
+    }
+    if (strncmp(line, "BY TUNE ", 8U) == 0)
+    {
+        float values[2];
+        char *token = strtok(&line[8], " ");
+        for (i = 0U; i < 2U; i++)
+        {
+            if (!Pitch_Test_SerialParseFloat(token, &values[i]))
+            {
+                Pitch_Test_SerialSend("ERR BY TUNE speed_kp speed_ki\r\n");
+                return;
+            }
+            token = strtok(NULL, " ");
+        }
+        if ((token != NULL) || (values[0] <= 0.0f) || (values[0] > 1000.0f) ||
+            (values[1] < 0.0f) || (values[1] > 20.0f))
+        {
+            Pitch_Test_SerialSend("ERR BY TUNE range\r\n");
+            return;
+        }
+        g_big_yaw_speed_pid.kp = values[0];
+        g_big_yaw_speed_pid.ki = values[1];
+        Yaw_LegacyPid_Clear(&g_big_yaw_speed_pid);
+        g_big_yaw_debug_enabled = 1U;
+        Pitch_Test_SerialSend("ACK BY TUNE\r\n");
+        return;
+    }
 
     /* Yaw 调试命令只设置目标，运动仍由主循环的视觉控制路径执行。 */
     if (strcmp(line, "YAW STOP") == 0)
@@ -611,6 +758,108 @@ static uint8_t Pitch_Test_AimIsActive(const vision_aim_command_t *aim,
                       VISION_AIM_TIMEOUT_MS) && (aim->aim_enabled != 0U));
 }
 
+/*
+ * 大 Yaw（6020 ID1）只负责小陀螺反向补偿，ID2 小 Yaw 不参与此链路。
+ * A5中的底盘转速由四轮反馈反算，单位rpm，正值为逆时针，与两套IMU同号。
+ * ID1按输出轴端逆时针为正配置：底盘逆时针时，ID1目标为负以反向补偿。
+ */
+static int16_t Big_Yaw_Update(void)
+{
+    const imu_system_t *imu = IMU_System_GetData();
+    remote_chassis_status_t chassis = {0};
+    dji_6020_feedback_t feedback = {0};
+    dji_6020_feedback_t small_yaw_feedback = {0};
+    uint32_t now_ms;
+    float target_rpm;
+
+    /* 修改：先取同一轮反馈快照，再取时间；防止新帧时间比入口旧时间晚1ms，
+     * 无符号相减误判超时并清空积分。有效性判断和控制共用这两份快照。 */
+    Remote_Control_GetChassisStatus(&chassis);
+    DJI_6020_GetFeedback(BIG_YAW_MOTOR_INDEX, &feedback);
+    DJI_6020_GetFeedback(YAW_MOTOR_INDEX, &small_yaw_feedback);
+    now_ms = HAL_GetTick();
+    /* 修改：IMU随ID2转，扣除ID2相对角才能得到大Yaw的惯性朝向。
+     * 全部角度差都取最短角，跨过IMU的±180度或编码器零点不产生大误差。 */
+    g_big_yaw_hold_valid = (uint8_t)((imu->initialized != 0U) &&
+        isfinite(imu->ekf.yaw) &&
+        (small_yaw_feedback.update_tick_ms != 0U) &&
+        ((uint32_t)(now_ms - small_yaw_feedback.update_tick_ms) <=
+         PITCH_MOTOR_TIMEOUT_MS));
+    if (g_big_yaw_hold_valid != 0U)
+    {
+        g_big_yaw_hold_heading = Yaw_ShortestError(
+            imu->ekf.yaw * 57.29578f,
+            g_big_yaw_small_yaw_sign * Pitch_Test_GetAngle(&small_yaw_feedback));
+    }
+    if ((chassis.update_tick_ms == 0U) ||
+        ((uint32_t)(now_ms - chassis.update_tick_ms) >
+         BIG_YAW_STATUS_TIMEOUT_MS) ||
+        (chassis.small_gyro_enable == 0U) ||
+        (feedback.update_tick_ms == 0U) ||
+        ((uint32_t)(now_ms - feedback.update_tick_ms) >
+         PITCH_MOTOR_TIMEOUT_MS))
+    {
+        if ((g_big_yaw_enabled != 0U) &&
+            (chassis.small_gyro_enable != 0U))
+        {
+            g_big_yaw_drop_count++;
+        }
+        g_big_yaw_enabled = 0U;
+        g_big_yaw_debug_target_rpm = 0;
+        g_big_yaw_debug_speed_rpm = 0;
+        g_big_yaw_debug_current = 0;
+        Yaw_LegacyPid_Clear(&g_big_yaw_speed_pid);
+        Big_Yaw_ClearHold();
+        return 0;
+    }
+
+    target_rpm = BIG_YAW_COMPENSATION_SIGN * chassis.chassis_z_speed_rpm;
+    if ((g_big_yaw_hold_enabled != 0U) && (g_big_yaw_hold_valid != 0U))
+    {
+        float correction_request;
+
+        if (g_big_yaw_hold_initialized == 0U)
+        {
+            g_big_yaw_hold_target = g_big_yaw_hold_heading;
+            g_big_yaw_hold_initialized = 1U;
+        }
+        g_big_yaw_hold_error = Yaw_ShortestError(
+            g_big_yaw_hold_target, g_big_yaw_hold_heading);
+        correction_request = g_big_yaw_hold_kp * g_big_yaw_hold_error +
+                             g_big_yaw_hold_trim;
+        /* 修改：小积分补恒速静差，修正饱和时只允许积分向退出饱和的方向变化。 */
+        if (((correction_request < BIG_YAW_HOLD_MAX_RPM) &&
+             (correction_request > -BIG_YAW_HOLD_MAX_RPM)) ||
+            ((correction_request >= BIG_YAW_HOLD_MAX_RPM) &&
+             (g_big_yaw_hold_error < 0.0f)) ||
+            ((correction_request <= -BIG_YAW_HOLD_MAX_RPM) &&
+             (g_big_yaw_hold_error > 0.0f)))
+        {
+            g_big_yaw_hold_trim = Pitch_Test_Clamp(
+                g_big_yaw_hold_trim + g_big_yaw_hold_ki *
+                g_big_yaw_hold_error * PITCH_CONTROL_PERIOD_S,
+                BIG_YAW_HOLD_TRIM_MAX_RPM);
+        }
+        g_big_yaw_hold_correction = Pitch_Test_Clamp(
+            g_big_yaw_hold_kp * g_big_yaw_hold_error + g_big_yaw_hold_trim,
+            BIG_YAW_HOLD_MAX_RPM);
+        /* ID1反馈正转对应惯性yaw增大；正角度误差增加ID1正向目标rpm。 */
+        target_rpm += g_big_yaw_hold_correction;
+    }
+    else
+    {
+        /* ID2/IMU不可用时撤销外环，保留原反向速度补偿；恢复后重新锚定。 */
+        Big_Yaw_ClearHold();
+    }
+    target_rpm = Pitch_Test_Clamp(target_rpm, BIG_YAW_SPEED_MAX_RPM);
+    g_big_yaw_enabled = 1U;
+    g_big_yaw_debug_target_rpm = target_rpm;
+    g_big_yaw_debug_speed_rpm = feedback.speed_rpm;
+    g_big_yaw_debug_current = (int16_t)Yaw_LegacyPid_Delta(
+        &g_big_yaw_speed_pid, target_rpm, (float)feedback.speed_rpm);
+    return g_big_yaw_debug_current;
+}
+
 static int16_t Yaw_Update(const remote_control_t *remote,
                           const vision_aim_command_t *aim,
                           uint8_t aim_active,
@@ -626,11 +875,12 @@ static int16_t Yaw_Update(const remote_control_t *remote,
     if ((DJI_6020_IsOnline(YAW_MOTOR_INDEX, now_ms,
                             PITCH_MOTOR_TIMEOUT_MS) == 0U) ||
         ((g_yaw_serial_mode == 0U) &&
-        (((aim->aim_enabled != 0U) && (aim_active == 0U)) ||
-        ((aim->aim_enabled == 0U) &&
-         ((g_pitch_remote_online == 0U) ||
-          (g_pitch_remote_valid == 0U) ||
-           (remote->switch_position[RC_S_LEFT] != RC_SW_MID))))))
+         (((aim->aim_enabled != 0U) && (aim_active == 0U)) ||
+          ((aim->aim_enabled == 0U) &&
+           ((g_pitch_remote_online == 0U) ||
+            (g_pitch_remote_valid == 0U) ||
+            ((remote->switch_position[RC_S_LEFT] != RC_SW_MID) &&
+             (remote->switch_position[RC_S_LEFT] != RC_SW_UP)))))))
     {
         g_yaw_target_initialized = 0U;
         g_aim_yaw_applied_frame_count = 0U;
@@ -773,6 +1023,22 @@ void Pitch_Test_Init(void)
            sizeof(g_pitch_serial_pending_line));
     g_yaw_target_initialized = 0U;
     g_yaw_mode = YAW_MODE_DISABLED;
+    g_big_yaw_enabled = 0U;
+    g_big_yaw_debug_target_rpm = 0;
+    g_big_yaw_debug_speed_rpm = 0;
+    g_big_yaw_debug_current = 0;
+    g_big_yaw_debug_enabled = 0U;
+    g_big_yaw_drop_count = 0U;
+    /* 修改：正反转验证后默认启用；进入小陀螺时锁定当时的大Yaw朝向。 */
+    g_big_yaw_hold_enabled = 1U;
+    g_big_yaw_hold_valid = 0U;
+    /* 修改：ID2小角度往返实测，编码器角与IMU航向同向，扣除系数为+1。 */
+    g_big_yaw_small_yaw_sign = 1.0f;
+    g_big_yaw_hold_kp = BIG_YAW_HOLD_ANGLE_KP;
+    g_big_yaw_hold_ki = BIG_YAW_HOLD_ANGLE_KI;
+    g_big_yaw_hold_heading = 0.0f;
+    g_big_yaw_hold_target = 0.0f;
+    Big_Yaw_ClearHold();
     g_aim_yaw_applied_frame_count = 0U;
     g_aim_pitch_applied_frame_count = 0U;
     g_aim_yaw_target_angle = 0.0f;
@@ -781,6 +1047,9 @@ void Pitch_Test_Init(void)
                        0.0f, YAW_ANGLE_MAX_RPM);
     Yaw_LegacyPid_Init(&g_yaw_speed_pid, YAW_SPEED_KP, YAW_SPEED_KI, 0.0f,
                        YAW_SPEED_MAX_I, YAW_CURRENT_LIMIT);
+    Yaw_LegacyPid_Init(&g_big_yaw_speed_pid, BIG_YAW_SPEED_KP,
+                       BIG_YAW_SPEED_KI, 0.0f, BIG_YAW_SPEED_MAX_I,
+                       BIG_YAW_CURRENT_LIMIT);
     Yaw_LegacyPid_Init(&g_yaw_aim_speed_pid, YAW_AIM_SPEED_KP, YAW_AIM_SPEED_KI,
                        0.0f, YAW_AIM_SPEED_MAX_I, YAW_CURRENT_LIMIT);
     g_yaw_serial_mode = 0U;
@@ -804,6 +1073,7 @@ void Pitch_Test_Update(void)
     float angle_error;
     float current_request;
     int16_t pitch_current = 0;
+    int16_t big_yaw_current;
     int16_t yaw_current;
     int16_t rc_input;
     uint8_t aim_active;
@@ -841,14 +1111,15 @@ void Pitch_Test_Update(void)
         Yaw_LegacyPid_Clear(&g_yaw_aim_speed_pid);
     }
 
-    /* 鑷瀯鐢?USART6 鐙珛浣胯兘锛涘彧鏈夋墜鍔ㄦā寮忚姹傞仴鎺у湪绾夸笖宸﹀紑鍏崇疆涓€?*/
+    /* 自瞄由USART6独立使能；手动/小陀螺模式要求左开关中档或上档。 */
     if ((g_pitch_motor_online == 0U) ||
         ((g_pitch_serial_mode == 0U) &&
          (((aim.aim_enabled != 0U) && (aim_active == 0U)) ||
           ((aim.aim_enabled == 0U) &&
            ((g_pitch_remote_online == 0U) ||
             (g_pitch_remote_valid == 0U) ||
-            (remote.switch_position[RC_S_LEFT] != RC_SW_MID))))))
+            ((remote.switch_position[RC_S_LEFT] != RC_SW_MID) &&
+             (remote.switch_position[RC_S_LEFT] != RC_SW_UP)))))))
     {
         g_pitch_target_initialized = 0U;
         g_aim_pitch_applied_frame_count = 0U;
@@ -961,10 +1232,12 @@ void Pitch_Test_Update(void)
         g_pitch_friction_ff = 0.0f;
     }
 
+    big_yaw_current = Big_Yaw_Update();
     yaw_current = Yaw_Update(&remote, &aim, aim_active, now_ms);
     g_pitch_debug_current = pitch_current;
-    /* CAN2缁熶竴鍙戦€侊細ID1鍥哄畾闆剁數娴併€両D2 Yaw銆両D3 Pitch銆?*/
-    if (DJI_6020_SendCurrent(&hcan2, 0, yaw_current, pitch_current, 0) != HAL_OK)
+    /* 修改：CAN2统一发送ID1大Yaw补偿、ID2小Yaw和ID3 Pitch输出。 */
+    if (DJI_6020_SendCurrent(&hcan2, big_yaw_current, yaw_current,
+                             pitch_current, 0) != HAL_OK)
     {
         g_pitch_can_tx_fail++;
     }
@@ -977,24 +1250,96 @@ void Pitch_Test_Update(void)
 
 uint32_t Pitch_Test_DebugPeriodMs(void)
 {
+    /* 修改：小陀螺自动启用快照；BY GET可继续记录停车和换向过程。 */
+    if ((g_big_yaw_enabled != 0U) || (g_big_yaw_debug_enabled != 0U))
+    {
+        return BIG_YAW_DEBUG_PERIOD_MS;
+    }
     return (g_yaw_debug_enabled != 0U) ? 20U : PITCH_DEBUG_PERIOD_MS;
 }
 
 void Pitch_Test_DebugPrint(void)
 {
-    remote_control_t remote = {0};
+    const imu_system_t *imu = IMU_System_GetData();
     vision_aim_command_t aim = {0};
+    remote_chassis_status_t chassis_status = {0};
+    dji_6020_feedback_t big_yaw_feedback = {0};
+    dji_6020_feedback_t yaw_feedback = {0};
     dji_6020_feedback_t pitch_feedback = {0};
     static char message[512];
     uint32_t now_ms = HAL_GetTick();
     uint32_t frame_age_ms;
+    float yaw_angle;
     float pitch_angle;
+    float yaw_target;
+    int yaw_limit;
     int pitch_limit;
     int length;
 
-    /* 上一条 DMA 未发完时，不改写正在发送的 Pitch 快照。 */
+    /* 恢复完整自瞄输出：上一条 DMA 未发完时，不改写发送缓冲。 */
     if (huart6.gState != HAL_UART_STATE_READY)
     {
+        return;
+    }
+
+    if ((g_big_yaw_enabled != 0U) || (g_big_yaw_debug_enabled != 0U))
+    {
+        uint32_t status_age_ms;
+
+        Remote_Control_GetChassisStatus(&chassis_status);
+        DJI_6020_GetFeedback(BIG_YAW_MOTOR_INDEX, &big_yaw_feedback);
+        DJI_6020_GetFeedback(YAW_MOTOR_INDEX, &yaw_feedback);
+        /* 修改：快照后的时间也用于遥测，避免on/age被跨毫秒更新误报。 */
+        now_ms = HAL_GetTick();
+        status_age_ms = (chassis_status.update_tick_ms != 0U) ?
+                        (uint32_t)(now_ms - chassis_status.update_tick_ms) :
+                        UINT32_MAX;
+        /* 修改：ms/age为毫秒，chz/trpm/rpm为rpm，yaw为度，gz为度/秒。
+         * err = 目标转速 - ID1反馈；gz和yaw用来判断是否真正保持朝向。 */
+        length = snprintf(message, sizeof(message),
+            "BY:ms=%lu on=%u en=%u age=%lu chz=%.2f trpm=%.2f "
+            "rpm=%d err=%.2f cmd=%d fbI=%d temp=%u "
+            "yaw=%.2f gz=%.2f kp=%.1f ki=%.3f drop=%lu "
+            "becd=%u secd=%u sa=%.2f hold=%u hv=%u "
+            "hd=%.2f ht=%.2f he=%.2f cor=%.2f trim=%.2f "
+            "akp=%.3f aki=%.4f sd=%.0f\r\n",
+            (unsigned long)now_ms,
+            (unsigned int)((big_yaw_feedback.update_tick_ms != 0U) &&
+                ((uint32_t)(now_ms - big_yaw_feedback.update_tick_ms) <=
+                 PITCH_MOTOR_TIMEOUT_MS)),
+            (unsigned int)g_big_yaw_enabled,
+            (unsigned long)status_age_ms,
+            (double)chassis_status.chassis_z_speed_rpm,
+            (double)g_big_yaw_debug_target_rpm,
+            (int)big_yaw_feedback.speed_rpm,
+            (double)(g_big_yaw_debug_target_rpm -
+                     (float)big_yaw_feedback.speed_rpm),
+            (int)g_big_yaw_debug_current,
+            (int)big_yaw_feedback.given_current,
+            (unsigned int)big_yaw_feedback.temperature,
+            (double)(imu->ekf.yaw * 57.29578f),
+            (double)(imu->gyro[2] * 57.29578f),
+            (double)g_big_yaw_speed_pid.kp,
+            (double)g_big_yaw_speed_pid.ki,
+            (unsigned long)g_big_yaw_drop_count,
+            (unsigned int)big_yaw_feedback.ecd,
+            (unsigned int)yaw_feedback.ecd,
+            (double)Pitch_Test_GetAngle(&yaw_feedback),
+            (unsigned int)g_big_yaw_hold_enabled,
+            (unsigned int)g_big_yaw_hold_valid,
+            (double)g_big_yaw_hold_heading,
+            (double)g_big_yaw_hold_target,
+            (double)g_big_yaw_hold_error,
+            (double)g_big_yaw_hold_correction,
+            (double)g_big_yaw_hold_trim,
+            (double)g_big_yaw_hold_kp,
+            (double)g_big_yaw_hold_ki,
+            (double)g_big_yaw_small_yaw_sign);
+        if ((length > 0) && (length < (int)sizeof(message)))
+        {
+            (void)HAL_UART_Transmit_DMA(&huart6, (uint8_t *)message,
+                                       (uint16_t)length);
+        }
         return;
     }
 
@@ -1025,53 +1370,68 @@ void Pitch_Test_DebugPrint(void)
         return;
     }
 
-    Remote_Control_Get(&remote);
     Vision_Aim_Get(&aim);
+    Remote_Control_GetChassisStatus(&chassis_status);
+    DJI_6020_GetFeedback(BIG_YAW_MOTOR_INDEX, &big_yaw_feedback);
+    DJI_6020_GetFeedback(YAW_MOTOR_INDEX, &yaw_feedback);
     DJI_6020_GetFeedback(PITCH_MOTOR_INDEX, &pitch_feedback);
     frame_age_ms = (aim.valid_frame_count != 0U) ?
                    (uint32_t)(now_ms - aim.last_rx_tick_ms) : UINT32_MAX;
+    yaw_angle = Pitch_Test_GetAngle(&yaw_feedback);
     pitch_angle = Pitch_Test_GetAngle(&pitch_feedback);
+    yaw_target = (g_aim_active != 0U) ? g_aim_yaw_target_angle : g_yaw_target_angle;
+    yaw_limit = (yaw_angle <= YAW_ANGLE_MIN_DEG) ? -1 :
+                ((yaw_angle >= YAW_ANGLE_MAX_DEG) ? 1 : 0);
     pitch_limit = (pitch_angle <= PITCH_ANGLE_MIN_DEG) ? -1 :
                   ((pitch_angle >= PITCH_ANGLE_MAX_DEG) ? 1 : 0);
 
-    /* USART6 每秒输出一次完整 Pitch 快照，用于重力补偿测量。 */
+    /* a/t/yerr/perr 单位为度；cur 为命令/反馈电流，age 单位为毫秒。 */
     length = snprintf(message, sizeof(message),
-                      "PIT:on=%u serial=%u rc=%u/%u sw=%u ch=%d "
-                      "init=%u ecd=%u last=%u a=%.2f t=%.2f e=%.2f "
-                      "rpm=%d prpm=%d cmd=%d fbI=%d temp=%u int=%.1f "
-                      "gff=%.0f fff=%.0f lim=%d txfail=%lu "
-                      "AIM:en=%u active=%u valid=%u fresh=%u perr=%.2f seq=%u age=%lu\r\n",
-                      (unsigned int)DJI_6020_IsOnline(PITCH_MOTOR_INDEX, now_ms,
-                                                     PITCH_MOTOR_TIMEOUT_MS),
-                      (unsigned int)g_pitch_serial_mode,
-                      (unsigned int)g_pitch_remote_online,
-                      (unsigned int)g_pitch_remote_valid,
-                      (unsigned int)remote.switch_position[RC_S_LEFT],
-                      (int)g_pitch_debug_channel,
-                      (unsigned int)g_pitch_target_initialized,
-                      (unsigned int)pitch_feedback.ecd,
-                      (unsigned int)pitch_feedback.last_ecd,
-                      (double)pitch_angle,
-                      (double)g_pitch_target_angle,
-                      (double)g_pitch_debug_error,
-                      (int)pitch_feedback.speed_rpm,
-                      (int)g_pitch_debug_target_rpm,
-                      (int)g_pitch_debug_current,
-                      (int)pitch_feedback.given_current,
-                      (unsigned int)pitch_feedback.temperature,
-                      (double)g_pitch_integral,
-                      (double)g_pitch_gravity_ff,
-                      (double)g_pitch_friction_ff,
-                      pitch_limit,
-                      (unsigned long)g_pitch_can_tx_fail,
+                      "AIM:enabled=%u active=%u valid=%u fresh=%u "
+                      "seq=%u yerr=%.2f perr=%.2f bytes=%lu frames=%lu new=%lu bad=%lu age=%lu "
+                      "Y:on=%u a=%.1f t=%.1f cur=%d/%d lim=%d "
+                      "BY:on=%u en=%u chz=%.1f trpm=%d rpm=%d cmd=%d "
+                      "P:on=%u a=%.1f t=%.1f cur=%d/%d lim=%d txfail=%lu "
+                      "IMU:yaw=%.2f roll=%.2f\r\n",
                       (unsigned int)aim.aim_enabled,
                       (unsigned int)g_aim_active,
                       (unsigned int)aim.target_valid,
                       (unsigned int)((aim.valid_frame_count != 0U) &&
                                      (frame_age_ms <= VISION_AIM_TIMEOUT_MS)),
-                      (double)aim.pitch_error_cdeg / 100.0,
                       (unsigned int)aim.seq,
-                      (unsigned long)frame_age_ms);
+                      (double)aim.yaw_error_cdeg / 100.0,
+                      (double)aim.pitch_error_cdeg / 100.0,
+                      (unsigned long)aim.rx_byte_count,
+                      (unsigned long)aim.valid_frame_count,
+                      (unsigned long)aim.new_frame_count,
+                      (unsigned long)aim.checksum_error_count,
+                      (unsigned long)frame_age_ms,
+                      (unsigned int)DJI_6020_IsOnline(YAW_MOTOR_INDEX, now_ms,
+                                                     PITCH_MOTOR_TIMEOUT_MS),
+                      (double)yaw_angle,
+                      (double)yaw_target,
+                      (int)g_yaw_debug_current,
+                      (int)yaw_feedback.given_current,
+                      yaw_limit,
+                      (unsigned int)DJI_6020_IsOnline(BIG_YAW_MOTOR_INDEX,
+                                                     now_ms,
+                                                     PITCH_MOTOR_TIMEOUT_MS),
+                      (unsigned int)g_big_yaw_enabled,
+                      (double)chassis_status.chassis_z_speed_rpm,
+                      (int)g_big_yaw_debug_target_rpm,
+                      (int)big_yaw_feedback.speed_rpm,
+                      (int)g_big_yaw_debug_current,
+                      (unsigned int)DJI_6020_IsOnline(PITCH_MOTOR_INDEX, now_ms,
+                                                     PITCH_MOTOR_TIMEOUT_MS),
+                      (double)pitch_angle,
+                      (double)g_pitch_target_angle,
+                      (int)g_pitch_debug_current,
+                      (int)pitch_feedback.given_current,
+                      pitch_limit,
+                      (unsigned long)g_pitch_can_tx_fail,
+                      /* EKF 内部为弧度，串口统一输出角度（度）。 */
+                      (double)(imu->ekf.yaw * 57.29578f),
+                      (double)(imu->ekf.roll * 57.29578f));
     if ((length > 0) && (length < (int)sizeof(message)))
     {
         (void)HAL_UART_Transmit_DMA(&huart6, (uint8_t *)message,

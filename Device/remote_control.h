@@ -27,10 +27,20 @@ typedef struct
     uint32_t update_tick_ms;
 } remote_control_t;
 
+/* 方向修正：A5底盘转速单位rpm，逆时针为正，与两套IMU的Yaw增大方向一致。 */
+typedef struct
+{
+    float chassis_z_speed_rpm;
+    uint8_t small_gyro_enable;
+    uint32_t update_tick_ms;
+} remote_chassis_status_t;
+
 void Remote_Control_Init(void);
 void Remote_Control_UART_IRQHandler(void);
 void Remote_Control_Link_UART_IRQHandler(void);
 void Remote_Control_Get(remote_control_t *remote);
+void Remote_Control_GetChassisStatus(remote_chassis_status_t *status);
+uint8_t Remote_Control_ChassisStatusValid(uint32_t now_ms, uint32_t timeout_ms);
 uint8_t Remote_Control_IsOnline(uint32_t now_ms, uint32_t timeout_ms);
 uint8_t Remote_Control_DataValid(const remote_control_t *remote);
 uint8_t Remote_Control_GetSource(void);

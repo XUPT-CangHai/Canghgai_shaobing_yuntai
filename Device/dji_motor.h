@@ -17,7 +17,7 @@ typedef struct
     uint32_t update_tick_ms;
 } dji_motor_feedback_t;
 
-/* CAN2 GM6020反馈：0x205、0x206、0x207对应ID1、ID2、ID3；本工程当前控制ID2和ID3。 */
+/* CAN2 GM6020反馈：0x205、0x206、0x207对应ID1大Yaw、ID2小Yaw、ID3 Pitch。 */
 typedef struct
 {
     uint16_t ecd;              /* 编码器原始角度，范围 0~8191 */

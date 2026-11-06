@@ -5,7 +5,7 @@
 
 #define VISION_AIM_FRAME_SIZE 13U
 #define VISION_AIM_TIMEOUT_MS 200U
-#define VISION_AIM_LOST_CLOSE_MS 5000U
+#define VISION_AIM_LOST_CLOSE_MS 10000U /* 连续 10 秒无目标才关闭自瞄。 */
 
 /*
  * USB CDC 视觉自瞄帧（固定 13 字节，小端）：
@@ -40,7 +40,7 @@ void Vision_Aim_DebugUartStart(void);
 /* 可在 USB CDC 回调中调用；内部只解析和发布快照，不控制电机。 */
 void Vision_Aim_Receive(const uint8_t *data, uint32_t length);
 void Vision_Aim_Get(vision_aim_command_t *command);
-/* 由主循环调用，5 秒没有有效目标时自动关闭自瞄。 */
+/* 由主循环调用，10 秒没有有效目标时自动关闭自瞄。 */
 void Vision_Aim_Service(void);
 void Vision_Aim_Invalidate(void);
 

@@ -354,7 +354,7 @@ int main(void)
       }
       Pitch_Test_Update();
       /* Shooter output remains disabled during IMU and gimbal observation. */
-      /* �?ms更新CAN2�?020 ID2 Yaw和ID3 Pitch位置控制，ID1不控制�?*/
+      /* 每2ms更新CAN2：ID1大Yaw小陀螺补偿、ID2小Yaw、ID3 Pitch。 */
 
     }
 
@@ -365,7 +365,7 @@ int main(void)
       Vision_SendImuFrame();
     }
 
-    /* USART6 每秒只输出一次完整 Pitch 调试数据。 */
+    /* 修改：USART6按模式输出，ID1小陀螺50ms，ID2调参20ms，默认自瞄1s。 */
     if ((uint32_t)(HAL_GetTick() - aim_debug_tick_ms) >= Pitch_Test_DebugPeriodMs())
     {
       aim_debug_tick_ms = HAL_GetTick();

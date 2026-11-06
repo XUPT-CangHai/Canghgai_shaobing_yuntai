@@ -26,7 +26,7 @@ static void Vision_Aim_Enable(void)
     g_have_sequence = 0U;
     g_vision_aim.aim_enabled = 1U;
     g_vision_aim.enable_count++;
-    /* 开启后若一直没看到目标，也从开启时刻开始计 5 秒。 */
+    /* 开启后若一直没看到目标，也从开启时刻开始计 10 秒。 */
     g_vision_aim.last_target_tick_ms = HAL_GetTick();
     Vision_Aim_CommandReset();
 }
@@ -132,7 +132,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 
 void Vision_Aim_Invalidate(void)
 {
-    /* USB 断开等同于丢目标，由 Service 统一执行 5 秒自动关闭。 */
+    /* USB 断开等同于丢目标，由 Service 统一执行 10 秒自动关闭。 */
     g_vision_aim.target_valid = 0U;
     g_frame_length = 0U;
     g_have_sequence = 0U;
