@@ -68,3 +68,15 @@
 3142	3951	8153243356153668	cmake/stm32cubemx/CMakeFiles/USB_Device_Library.dir/__/__/Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Src/usbd_cdc.c.obj	8719b0ce7b336797
 1011	1792	8156640755087352	shaobing_yuntai.elf	f628d18712cca377
 15	2241	8154903834797423	CMakeFiles/shaobing_yuntai.dir/Device/imu_system.c.obj	2b1a64364a4e66a3
+5	264	8156664481411662	build.ninja	55d22d024df750c4
+5	264	8156664481411662	D:/沧海电控/电控资料及代码/code/CangHai_RoboMaster_Electrical/shaobing_yuntai/build/Debug/cmake_install.cmake	55d22d024df750c4
+5	264	8156664481411662	D:/沧海电控/电控资料及代码/code/CangHai_RoboMaster_Electrical/shaobing_yuntai/build/Debug/cmake/stm32cubemx/cmake_install.cmake	55d22d024df750c4
+19	872	8156664482352221	CMakeFiles/shaobing_yuntai.dir/USB_DEVICE/App/usbd_cdc_if.c.obj	887f9ce7dad7a3e7
+151	888	8156664483671017	CMakeFiles/shaobing_yuntai.dir/Application/shoot_test.c.obj	f84f934d646374de
+127	902	8156664483429655	CMakeFiles/shaobing_yuntai.dir/Device/vision_aim.c.obj	90c234ba6b9b902
+98	902	8156664483137121	CMakeFiles/shaobing_yuntai.dir/Core/Src/main.c.obj	f4f1e91c1397256a
+888	1091	8156664491032569	CMakeFiles/shaobing_yuntai.dir/Application/dual_yaw_aim.c.obj	7781a2415de8a1fe
+873	1276	8156664490897208	CMakeFiles/shaobing_yuntai.dir/Application/pitch_test.c.obj	646def9cdca30a5
+1276	2166	8156664494925456	shaobing_yuntai.elf	dcb6755e8395e82b
+41	458	8156666379551709	CMakeFiles/shaobing_yuntai.dir/Application/pitch_test.c.obj	646def9cdca30a5
+459	1024	8156666383738208	shaobing_yuntai.elf	dcb6755e8395e82b

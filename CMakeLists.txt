@@ -64,8 +64,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Device/ist8310driver_middleware.c
     Algorithm/pid.c
     Application/shoot_test.c
-    # CAN2 6020 ID2 Yaw + ID3 Pitch; ID1 is not controlled.
+    # 修改：CAN2 ID1/ID2静止双Yaw分配、ID3 Pitch，保留原小陀螺路径。
     Application/pitch_test.c
+    Application/dual_yaw_aim.c
 )
 
 # Add include paths

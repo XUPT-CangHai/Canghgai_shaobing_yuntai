@@ -8,6 +8,7 @@
 
 #include "can.h"
 #include "dji_motor.h"
+#include "dual_yaw_aim.h"
 #include "imu_system.h"
 #include "pid.h"
 #include "remote_control.h"
@@ -43,10 +44,15 @@
 #define YAW_SPEED_MAX_I          300.0f
 #define YAW_CURRENT_LIMIT        16000.0f
 /* 修改：2026-11-06现场确认ID2小Yaw机械中位ecd=3627，绝对编码器角159.39度。 */
-#define YAW_ANGLE_MIN_DEG        125.0f
-#define YAW_ANGLE_MAX_DEG        212.0f
+#define YAW_ANGLE_MIN_DEG        DUAL_YAW_SMALL_MIN_DEG
+#define YAW_ANGLE_MAX_DEG        DUAL_YAW_SMALL_MAX_DEG
 #define AIM_YAW_ERROR_MAX_DEG    45.0f
 #define AIM_PITCH_ERROR_MAX_DEG  20.0f
+/* 修改：画面右正与IMU/两轴编码器的逆时针正相反，只在控制入口取反一次。
+ * 新增速度/加速度暂只接收和遥测，前馈系数为0，不改变已经调好的PID。 */
+#define AIM_YAW_DIRECTION        (-1.0f)
+#define AIM_PITCH_DIRECTION      1.0f
+#define AIM_BRAKE_RPM_PER_S      800.0f
 
 /* 视觉/串口共用的 Yaw 参数，遥控参数仍使用上面的原值。 */
 #define YAW_AIM_ANGLE_KP         2.8f
@@ -58,7 +64,7 @@
 #define PITCH_MOTOR_TIMEOUT_MS  100U
 #define PITCH_REMOTE_TIMEOUT_MS 200U
 #define PITCH_RC_DEADZONE       40
-#define PITCH_CONTROL_PERIOD_S   0.002f /* main姣?ms璋冪敤涓€娆℃帶鍒躲€?*/
+#define PITCH_CONTROL_PERIOD_S   0.002f /* 修改：沿用main的2ms周期，保持速度环积分强度。 */
 #define PITCH_RC_MAX_SPEED_DEG_S 55.0f /* 婊℃潌鐩爣绉诲姩閫熷害锛涙寜瀹炴祴鎵嬫劅浠?5鎻愰珮鍒?0搴?s銆?*/
 #define PITCH_RC_STEP            (PITCH_RC_MAX_SPEED_DEG_S * PITCH_CONTROL_PERIOD_S / 660.0f)
 #define YAW_RC_STEP              (YAW_RC_MAX_SPEED_DEG_S * PITCH_CONTROL_PERIOD_S / 660.0f)
@@ -184,10 +190,14 @@ static int16_t g_yaw_debug_error10;
 static int16_t g_yaw_debug_target_rpm;
 static int16_t g_yaw_debug_speed_rpm;
 static int16_t g_yaw_debug_current;
-static uint32_t g_aim_yaw_applied_frame_count;
 static uint32_t g_aim_pitch_applied_frame_count;
-static float g_aim_yaw_target_angle;
 static uint8_t g_aim_active;
+/* 修改：静止视觉独占两轴Yaw；有效图像与模式使能分开，丢目标仍减速保持。 */
+static dual_yaw_aim_t g_dual_yaw_aim;
+static uint8_t g_static_aim_enabled;
+static uint8_t g_dual_yaw_active;
+static uint8_t g_pitch_aim_state;
+static float g_pitch_aim_target_rpm;
 
 static float Pitch_Test_Clamp(float value, float limit)
 {
@@ -754,7 +764,7 @@ static uint8_t Pitch_Test_AimIsActive(const vision_aim_command_t *aim,
                                       uint32_t now_ms)
 {
     return (uint8_t)((aim->target_valid != 0U) &&
-                     ((uint32_t)(now_ms - aim->last_rx_tick_ms) <=
+                     ((uint32_t)(now_ms - aim->last_new_target_tick_ms) <=
                       VISION_AIM_TIMEOUT_MS) && (aim->aim_enabled != 0U));
 }
 
@@ -860,9 +870,169 @@ static int16_t Big_Yaw_Update(void)
     return g_big_yaw_debug_current;
 }
 
+/* 修改：用本轮反馈快照判断在线，避免中断更新后与旧时间相减误判。 */
+static uint8_t Pitch_Test_MotorOnline(const dji_6020_feedback_t *feedback,
+                                      uint32_t now_ms)
+{
+    return (uint8_t)((feedback->update_tick_ms != 0U) &&
+        ((uint32_t)(now_ms - feedback->update_tick_ms) <= PITCH_MOTOR_TIMEOUT_MS));
+}
+
+static uint8_t Static_Aim_Allowed(const remote_control_t *remote,
+                                   const remote_chassis_status_t *chassis,
+                                   uint32_t now_ms)
+{
+    /* 修改：有过底盘A5后必须保持链路新鲜且停转；从未接A5可独立台架自瞄。
+     * 小陀螺的遥控请求也会屏蔽静止自瞄，本版不接视觉/小陀螺联动。 */
+    if ((chassis->update_tick_ms != 0U) &&
+        (((uint32_t)(now_ms - chassis->update_tick_ms) > BIG_YAW_STATUS_TIMEOUT_MS) ||
+         (chassis->small_gyro_enable != 0U) ||
+         (fabsf(chassis->chassis_z_speed_rpm) > 1.0f)))
+    {
+        return 0U;
+    }
+    if ((g_pitch_remote_online != 0U) && (g_pitch_remote_valid != 0U) &&
+        (remote->switch_position[RC_S_LEFT] == RC_SW_UP) &&
+        (remote->switch_position[RC_S_RIGHT] != RC_SW_MID))
+    {
+        return 0U;
+    }
+    return 1U;
+}
+
+static void Dual_Yaw_ControlReset(void)
+{
+    Dual_Yaw_Aim_Reset(&g_dual_yaw_aim);
+    g_dual_yaw_active = 0U;
+    g_big_yaw_enabled = 0U;
+    g_big_yaw_debug_target_rpm = 0.0f;
+    g_big_yaw_debug_current = 0;
+    g_yaw_debug_target_rpm = 0;
+    g_yaw_debug_current = 0;
+    g_yaw_target_initialized = 0U;
+    g_yaw_mode = YAW_MODE_DISABLED;
+    Big_Yaw_ClearHold();
+    Yaw_LegacyPid_Clear(&g_big_yaw_speed_pid);
+    Yaw_LegacyPid_Clear(&g_yaw_angle_pid);
+    Yaw_LegacyPid_Clear(&g_yaw_speed_pid);
+    Yaw_LegacyPid_Clear(&g_yaw_aim_speed_pid);
+}
+
+static void Static_DualYaw_Update(const vision_aim_command_t *aim,
+                                   uint8_t fresh,
+                                   const dji_6020_feedback_t *big,
+                                   const dji_6020_feedback_t *small,
+                                   uint32_t now_ms,
+                                   int16_t *big_current,
+                                   int16_t *small_current)
+{
+    const imu_system_t *imu = IMU_System_GetData();
+    float small_angle = Pitch_Test_GetAngle(small);
+    float small_request;
+
+    *big_current = 0;
+    *small_current = 0;
+    if ((imu->initialized == 0U) || !isfinite(imu->ekf.yaw) ||
+        (Pitch_Test_MotorOnline(big, now_ms) == 0U) ||
+        (Pitch_Test_MotorOnline(small, now_ms) == 0U))
+    {
+        /* 修改：任一Yaw反馈失效，整组退出并清两轴PID，禁止退回旧单轴视觉。 */
+        Dual_Yaw_ControlReset();
+        return;
+    }
+    g_dual_yaw_active = 1U;
+    g_big_yaw_enabled = 0U; /* 独立于原小陀螺补偿模式。 */
+    Dual_Yaw_Aim_Update(&g_dual_yaw_aim, fresh, aim->new_frame_count,
+        imu->ekf.yaw * 57.29578f, small_angle, (float)big->speed_rpm,
+        AIM_YAW_DIRECTION * (float)aim->yaw_error_cdeg / 100.0f,
+        g_yaw_aim_angle_kp, g_yaw_aim_max_rpm, PITCH_CONTROL_PERIOD_S);
+    *big_current = (int16_t)Yaw_LegacyPid_Delta(&g_big_yaw_speed_pid,
+        g_dual_yaw_aim.big_ref_rpm, (float)big->speed_rpm);
+    small_request = Yaw_AimSpeedPid(&g_yaw_aim_speed_pid,
+        g_dual_yaw_aim.small_ref_rpm, (float)small->speed_rpm);
+    /* 修改：软限位不仅限目标速度，也清除向外残余积分，向内恢复不受阻。 */
+    if (((small_angle <= YAW_ANGLE_MIN_DEG) && (small_request < 0.0f)) ||
+        ((small_angle >= YAW_ANGLE_MAX_DEG) && (small_request > 0.0f)))
+    {
+        small_request = 0.0f;
+        Yaw_LegacyPid_Clear(&g_yaw_aim_speed_pid);
+    }
+    *small_current = (int16_t)small_request;
+    g_big_yaw_debug_target_rpm = g_dual_yaw_aim.big_ref_rpm;
+    g_big_yaw_debug_speed_rpm = big->speed_rpm;
+    g_big_yaw_debug_current = *big_current;
+    g_yaw_mode = YAW_MODE_AIM;
+    g_yaw_debug_channel = 0;
+    g_yaw_debug_angle10 = (int16_t)(small_angle * 10.0f);
+    /* ID2调试目标仍是编码器角；相机惯性目标在AIM里的ct单独输出。 */
+    g_yaw_debug_target10 = (int16_t)(small_angle * 10.0f);
+    g_yaw_debug_error10 = (int16_t)(g_dual_yaw_aim.error_deg * 10.0f);
+    g_yaw_debug_target_rpm = (int16_t)g_dual_yaw_aim.small_ref_rpm;
+    g_yaw_debug_speed_rpm = small->speed_rpm;
+    g_yaw_debug_current = *small_current;
+}
+
+static float Aim_ApproachZero(float value)
+{
+    float step = AIM_BRAKE_RPM_PER_S * PITCH_CONTROL_PERIOD_S;
+    if (value > step) return value - step;
+    if (value < -step) return value + step;
+    return 0.0f;
+}
+
+static float Static_Pitch_TargetRpm(const vision_aim_command_t *aim,
+                                     uint8_t fresh,
+                                     float current_angle)
+{
+    if (g_pitch_aim_state == DUAL_YAW_AIM_OFF)
+    {
+        g_pitch_aim_state = DUAL_YAW_AIM_HOLD;
+        g_pitch_target_angle = Pitch_Test_ClampAngle(current_angle);
+        g_pitch_aim_target_rpm = 0.0f;
+        g_aim_pitch_applied_frame_count = aim->new_frame_count - 1U;
+    }
+    if ((fresh != 0U) &&
+        (g_aim_pitch_applied_frame_count != aim->new_frame_count))
+    {
+        /* 修改：新图像只锚定一次目标，重复seq不累计角度。 */
+        g_pitch_target_angle = Pitch_Test_ClampAngle(current_angle +
+            Pitch_Test_Clamp(AIM_PITCH_DIRECTION *
+                (float)aim->pitch_error_cdeg / 100.0f, AIM_PITCH_ERROR_MAX_DEG));
+        g_aim_pitch_applied_frame_count = aim->new_frame_count;
+        g_pitch_aim_state = DUAL_YAW_AIM_TRACK;
+    }
+    else if ((fresh == 0U) && (g_pitch_aim_state == DUAL_YAW_AIM_TRACK))
+    {
+        g_pitch_aim_state = DUAL_YAW_AIM_BRAKE;
+    }
+    g_pitch_debug_error = Pitch_Test_Clamp(g_pitch_target_angle - current_angle,
+                                            AIM_PITCH_ERROR_MAX_DEG);
+    if (g_pitch_aim_state == DUAL_YAW_AIM_BRAKE)
+    {
+        g_pitch_aim_target_rpm = Aim_ApproachZero(g_pitch_aim_target_rpm);
+        g_pitch_target_angle = Pitch_Test_ClampAngle(current_angle);
+        g_pitch_debug_error = 0.0f;
+        if ((g_pitch_aim_target_rpm == 0.0f) &&
+            (abs(g_pitch_feedback.speed_rpm) < 2))
+        {
+            g_pitch_aim_state = DUAL_YAW_AIM_HOLD;
+        }
+    }
+    else
+    {
+        g_pitch_aim_target_rpm = Yaw_LegacyPid_Position(&g_pitch_angle_pid,
+                                                       g_pitch_debug_error);
+        if (g_pitch_aim_state == DUAL_YAW_AIM_HOLD)
+        {
+            g_pitch_aim_target_rpm = Pitch_Test_Clamp(g_pitch_aim_target_rpm, 10.0f);
+        }
+    }
+    return g_pitch_aim_target_rpm;
+}
+
 static int16_t Yaw_Update(const remote_control_t *remote,
-                          const vision_aim_command_t *aim,
-                          uint8_t aim_active,
+                          const dji_6020_feedback_t *snapshot,
+                          uint8_t aim_enabled,
                           uint32_t now_ms)
 {
     dji_6020_feedback_t feedback = {0};
@@ -871,19 +1041,17 @@ static int16_t Yaw_Update(const remote_control_t *remote,
     float target_rpm;
     int16_t rc_input;
 
-    /* Yaw 浣跨敤 ID2锛涜嚜鐬勪笉渚濊禆閬ユ帶鍣紝寮€鍚絾鏃犳湁鏁堢洰鏍囨椂杈撳嚭闆剁數娴併€?*/
-    if ((DJI_6020_IsOnline(YAW_MOTOR_INDEX, now_ms,
-                            PITCH_MOTOR_TIMEOUT_MS) == 0U) ||
+    /* 修改：此入口只保留手动/串口ID2控制；静止视觉由双Yaw入口独占。 */
+    if ((Pitch_Test_MotorOnline(snapshot, now_ms) == 0U) ||
         ((g_yaw_serial_mode == 0U) &&
-         (((aim->aim_enabled != 0U) && (aim_active == 0U)) ||
-          ((aim->aim_enabled == 0U) &&
+         ((aim_enabled != 0U) ||
+          ((aim_enabled == 0U) &&
            ((g_pitch_remote_online == 0U) ||
             (g_pitch_remote_valid == 0U) ||
             ((remote->switch_position[RC_S_LEFT] != RC_SW_MID) &&
              (remote->switch_position[RC_S_LEFT] != RC_SW_UP)))))))
     {
         g_yaw_target_initialized = 0U;
-        g_aim_yaw_applied_frame_count = 0U;
         g_yaw_mode = YAW_MODE_DISABLED;
         Yaw_LegacyPid_Clear(&g_yaw_angle_pid);
         Yaw_LegacyPid_Clear(&g_yaw_speed_pid);
@@ -898,7 +1066,7 @@ static int16_t Yaw_Update(const remote_control_t *remote,
         return 0;
     }
 
-    DJI_6020_GetFeedback(YAW_MOTOR_INDEX, &feedback);
+    feedback = *snapshot;
     current_angle = Pitch_Test_GetAngle(&feedback);
     if (g_yaw_target_initialized == 0U)
     {
@@ -914,28 +1082,6 @@ static int16_t Yaw_Update(const remote_control_t *remote,
             Yaw_ShortestError(g_yaw_serial_target_angle, current_angle),
             AIM_YAW_ERROR_MAX_DEG);
         g_yaw_mode = 4U;
-    }
-    else if (aim_active != 0U)
-    {
-        if (g_aim_yaw_applied_frame_count != aim->new_frame_count)
-        {
-            g_aim_yaw_target_angle = current_angle +
-                ((float)aim->yaw_error_cdeg / 100.0f);
-            g_aim_yaw_applied_frame_count = aim->new_frame_count;
-        }
-        while (g_aim_yaw_target_angle >= 360.0f)
-        {
-            g_aim_yaw_target_angle -= 360.0f;
-        }
-        while (g_aim_yaw_target_angle < 0.0f)
-        {
-            g_aim_yaw_target_angle += 360.0f;
-        }
-        g_aim_yaw_target_angle = Yaw_ClampAngle(g_aim_yaw_target_angle);
-        angle_error = Pitch_Test_Clamp(
-            Yaw_ShortestError(g_aim_yaw_target_angle, current_angle),
-            AIM_YAW_ERROR_MAX_DEG);
-        g_yaw_mode = YAW_MODE_AIM;
     }
     else
     {
@@ -975,9 +1121,9 @@ static int16_t Yaw_Update(const remote_control_t *remote,
         }
     }
 
-    if ((g_yaw_serial_mode != 0U) || (aim_active != 0U))
+    if (g_yaw_serial_mode != 0U)
     {
-        /* 两条目标来源共用同一个视觉 Yaw 控制器。 */
+        /* 修改：串口阶跃沿用已调好的ID2视觉速度环。 */
         target_rpm = Pitch_Test_Clamp(angle_error * g_yaw_aim_angle_kp,
                                       g_yaw_aim_max_rpm);
         g_yaw_debug_current = (int16_t)Yaw_AimSpeedPid(
@@ -1039,10 +1185,13 @@ void Pitch_Test_Init(void)
     g_big_yaw_hold_heading = 0.0f;
     g_big_yaw_hold_target = 0.0f;
     Big_Yaw_ClearHold();
-    g_aim_yaw_applied_frame_count = 0U;
     g_aim_pitch_applied_frame_count = 0U;
-    g_aim_yaw_target_angle = 0.0f;
     g_aim_active = 0U;
+    g_static_aim_enabled = 0U;
+    g_dual_yaw_active = 0U;
+    g_pitch_aim_state = DUAL_YAW_AIM_OFF;
+    g_pitch_aim_target_rpm = 0.0f;
+    Dual_Yaw_Aim_Reset(&g_dual_yaw_aim);
     Yaw_LegacyPid_Init(&g_yaw_angle_pid, YAW_ANGLE_KP, 0.0f, 0.0f,
                        0.0f, YAW_ANGLE_MAX_RPM);
     Yaw_LegacyPid_Init(&g_yaw_speed_pid, YAW_SPEED_KP, YAW_SPEED_KI, 0.0f,
@@ -1067,111 +1216,100 @@ void Pitch_Test_Init(void)
 void Pitch_Test_Update(void)
 {
     remote_control_t remote = {0};
+    remote_chassis_status_t chassis = {0};
     vision_aim_command_t aim = {0};
-    uint32_t now_ms = HAL_GetTick();
+    dji_6020_feedback_t big = {0};
+    dji_6020_feedback_t small = {0};
+    uint32_t now_ms;
     float current_angle;
     float angle_error;
     float current_request;
+    float target_rpm;
     int16_t pitch_current = 0;
-    int16_t big_yaw_current;
-    int16_t yaw_current;
+    int16_t big_yaw_current = 0;
+    int16_t yaw_current = 0;
     int16_t rc_input;
-    uint8_t aim_active;
+    uint8_t static_aim;
     uint8_t pitch_control_enabled = 0U;
 
-    Remote_Control_Get(&remote);
+    /* 修改：先复制命令和所有反馈，再取本轮时间；控制不混用下一帧反馈。 */
     Vision_Aim_Service();
+    Remote_Control_Get(&remote);
+    Remote_Control_GetChassisStatus(&chassis);
     Vision_Aim_Get(&aim);
-    g_pitch_remote_online = Remote_Control_IsOnline(now_ms,
-                                                    PITCH_REMOTE_TIMEOUT_MS);
-    g_pitch_remote_valid = Remote_Control_DataValid(&remote);
-
     DJI_6020_GetFeedback(PITCH_MOTOR_INDEX, &g_pitch_feedback);
-    g_pitch_motor_online = DJI_6020_IsOnline(PITCH_MOTOR_INDEX,
-                                             now_ms,
-                                             PITCH_MOTOR_TIMEOUT_MS);
+    DJI_6020_GetFeedback(BIG_YAW_MOTOR_INDEX, &big);
+    DJI_6020_GetFeedback(YAW_MOTOR_INDEX, &small);
+    now_ms = HAL_GetTick();
+    g_pitch_remote_online = (uint8_t)((remote.update_tick_ms != 0U) &&
+        ((uint32_t)(now_ms - remote.update_tick_ms) <= PITCH_REMOTE_TIMEOUT_MS));
+    g_pitch_remote_valid = Remote_Control_DataValid(&remote);
+    g_pitch_motor_online = Pitch_Test_MotorOnline(&g_pitch_feedback, now_ms);
     current_angle = Pitch_Test_GetAngle(&g_pitch_feedback);
     Pitch_Test_SerialProcess(current_angle);
     g_pitch_debug_channel = remote.channel[1];
     g_pitch_debug_error = 0.0f;
-    aim_active = Pitch_Test_AimIsActive(&aim, now_ms);
-    if (aim_active != g_aim_active)
+    static_aim = (uint8_t)((aim.aim_enabled != 0U) &&
+        (g_yaw_serial_mode == 0U) && (g_pitch_serial_mode == 0U) &&
+        (Static_Aim_Allowed(&remote, &chassis, now_ms) != 0U));
+    if (static_aim != g_static_aim_enabled)
     {
-        /* 鑷瀯涓庨仴鎺у垏鎹㈡椂娓呮棫浣嶇疆鐜姸鎬侊紝閬垮厤鍒囨崲鐬棿杩芥棫鐩爣銆?*/
-        g_aim_active = aim_active;
-        g_aim_yaw_applied_frame_count = 0U;
-        g_aim_pitch_applied_frame_count = 0U;
+        /* 修改：只在模式切换时清环；丢目标进入刹停，不直接撤掉电流。 */
+        Dual_Yaw_ControlReset();
+        g_static_aim_enabled = static_aim;
+        g_pitch_aim_state = DUAL_YAW_AIM_OFF;
+        g_pitch_aim_target_rpm = 0.0f;
         g_pitch_target_initialized = 0U;
-        g_yaw_target_initialized = 0U;
         g_pitch_integral = 0.0f;
         Yaw_LegacyPid_Clear(&g_pitch_angle_pid);
         Yaw_LegacyPid_Clear(&g_pitch_speed_pid);
-        Yaw_LegacyPid_Clear(&g_yaw_angle_pid);
-        Yaw_LegacyPid_Clear(&g_yaw_speed_pid);
-        Yaw_LegacyPid_Clear(&g_yaw_aim_speed_pid);
     }
+    g_aim_active = (uint8_t)((static_aim != 0U) &&
+        (Pitch_Test_AimIsActive(&aim, now_ms) != 0U));
 
-    /* 自瞄由USART6独立使能；手动/小陀螺模式要求左开关中档或上档。 */
+    /* 修改：串口测试优先；静止视觉使能后无目标也会进入保持。
+     * 任一串口轴被接管时整组暂停视觉，避免ID1回中与测试互相打架。 */
     if ((g_pitch_motor_online == 0U) ||
-        ((g_pitch_serial_mode == 0U) &&
-         (((aim.aim_enabled != 0U) && (aim_active == 0U)) ||
-          ((aim.aim_enabled == 0U) &&
-           ((g_pitch_remote_online == 0U) ||
-            (g_pitch_remote_valid == 0U) ||
-            ((remote.switch_position[RC_S_LEFT] != RC_SW_MID) &&
-             (remote.switch_position[RC_S_LEFT] != RC_SW_UP)))))))
+        ((g_pitch_serial_mode == 0U) && (static_aim == 0U) &&
+         ((aim.aim_enabled != 0U) || (g_pitch_remote_online == 0U) ||
+          (g_pitch_remote_valid == 0U) ||
+          ((remote.switch_position[RC_S_LEFT] != RC_SW_MID) &&
+           (remote.switch_position[RC_S_LEFT] != RC_SW_UP)))))
     {
         g_pitch_target_initialized = 0U;
-        g_aim_pitch_applied_frame_count = 0U;
+        g_pitch_aim_state = DUAL_YAW_AIM_OFF;
+        g_pitch_aim_target_rpm = 0.0f;
         g_pitch_debug_target_rpm = 0;
-        /* 澶辫兘娓呯Н鍒嗭紝閲嶆柊鍚敤鏃朵笉甯﹀叆涓婃琛ュ伩銆?*/
         g_pitch_integral = 0.0f;
         Yaw_LegacyPid_Clear(&g_pitch_angle_pid);
         Yaw_LegacyPid_Clear(&g_pitch_speed_pid);
-        /* 澶辫兘鏃舵樉绀哄綋鍓嶄綅缃紱涓嬫浣胯兘閲嶆柊閽充綅锛屼笉杩借刀鏃х洰鏍囥€?*/
         g_pitch_target_angle = current_angle;
     }
-    else if (g_pitch_serial_mode != 0U)
+    else if ((g_pitch_serial_mode != 0U) || (static_aim != 0U))
     {
-        float target_rpm;
-
         pitch_control_enabled = 1U;
         g_pitch_target_initialized = 1U;
-        g_pitch_target_angle = Pitch_Test_ClampAngle(g_pitch_serial_target_angle);
-        angle_error = g_pitch_target_angle - current_angle;
-        g_pitch_debug_error = angle_error;
-        target_rpm = Yaw_LegacyPid_Position(&g_pitch_angle_pid, angle_error);
-        g_pitch_debug_target_rpm = (int16_t)target_rpm;
-        current_request = Pitch_SpeedPid_Position(
-            &g_pitch_speed_pid, target_rpm,
-            (float)g_pitch_feedback.speed_rpm *
-                PITCH_SPEED_FEEDBACK_DIRECTION);
-        pitch_current = (int16_t)Pitch_Test_Clamp(
-            current_request * PITCH_MOTOR_DIRECTION,
-            PITCH_CURRENT_LIMIT);
-    }
-    else if (aim_active != 0U)
-    {
-        float target_rpm;
-
-        pitch_control_enabled = 1U;
-        g_pitch_target_initialized = 1U;
-        if (g_aim_pitch_applied_frame_count != aim.new_frame_count)
+        if (g_pitch_serial_mode != 0U)
         {
-            g_pitch_target_angle = current_angle +
-                ((float)aim.pitch_error_cdeg / 100.0f);
-            g_aim_pitch_applied_frame_count = aim.new_frame_count;
+            g_pitch_target_angle = Pitch_Test_ClampAngle(g_pitch_serial_target_angle);
+            g_pitch_debug_error = g_pitch_target_angle - current_angle;
+            target_rpm = Yaw_LegacyPid_Position(&g_pitch_angle_pid,
+                                                 g_pitch_debug_error);
         }
-        g_pitch_target_angle = Pitch_Test_ClampAngle(g_pitch_target_angle);
-        angle_error = Pitch_Test_Clamp(
-            g_pitch_target_angle - current_angle, AIM_PITCH_ERROR_MAX_DEG);
-        g_pitch_debug_error = angle_error;
-        target_rpm = Yaw_LegacyPid_Position(&g_pitch_angle_pid, angle_error);
+        else
+        {
+            target_rpm = Static_Pitch_TargetRpm(&aim, g_aim_active, current_angle);
+        }
+        if (((current_angle <= PITCH_ANGLE_MIN_DEG) && (target_rpm < 0.0f)) ||
+            ((current_angle >= PITCH_ANGLE_MAX_DEG) && (target_rpm > 0.0f)))
+        {
+            target_rpm = 0.0f;
+            g_pitch_aim_target_rpm = 0.0f;
+            Yaw_LegacyPid_Clear(&g_pitch_speed_pid);
+        }
         g_pitch_debug_target_rpm = (int16_t)target_rpm;
-        current_request = Pitch_SpeedPid_Position(
-            &g_pitch_speed_pid, target_rpm,
-            (float)g_pitch_feedback.speed_rpm *
-                PITCH_SPEED_FEEDBACK_DIRECTION);
+        current_request = Pitch_SpeedPid_Position(&g_pitch_speed_pid, target_rpm,
+            (float)g_pitch_feedback.speed_rpm * PITCH_SPEED_FEEDBACK_DIRECTION);
         pitch_current = (int16_t)Pitch_Test_Clamp(
             current_request * PITCH_MOTOR_DIRECTION, PITCH_CURRENT_LIMIT);
     }
@@ -1185,46 +1323,47 @@ void Pitch_Test_Update(void)
             g_pitch_integral = 0.0f;
             g_pitch_target_initialized = 1U;
         }
-
-        /* 鍙虫憞鏉嗗瀭鐩撮€氶亾涓?channel[1]锛岀洰鏍囪搴﹂檺鍒跺湪26~80搴︺€?*/
         rc_input = remote.channel[1];
-        if ((rc_input < PITCH_RC_DEADZONE) &&
-            (rc_input > -PITCH_RC_DEADZONE))
+        if ((rc_input < PITCH_RC_DEADZONE) && (rc_input > -PITCH_RC_DEADZONE))
         {
             rc_input = 0;
         }
-        g_pitch_target_angle += (float)rc_input * PITCH_RC_STEP *
-                                PITCH_RC_DIRECTION;
+        g_pitch_target_angle += (float)rc_input * PITCH_RC_STEP * PITCH_RC_DIRECTION;
         g_pitch_target_angle = Pitch_Test_ClampAngle(g_pitch_target_angle);
-
         angle_error = g_pitch_target_angle - current_angle;
         g_pitch_debug_error = angle_error;
         current_request = angle_error * PITCH_ANGLE_KP + g_pitch_integral;
-        /* 杈撳嚭楗卞拰鏃朵粎鍏佽鍙嶅悜绉垎锛岄伩鍏嶇户缁悜楗卞拰鏂瑰悜绉疮銆?*/
         if (((current_request < PITCH_CURRENT_LIMIT) &&
              (current_request > -PITCH_CURRENT_LIMIT)) ||
             ((current_request >= PITCH_CURRENT_LIMIT) && (angle_error < 0.0f)) ||
             ((current_request <= -PITCH_CURRENT_LIMIT) && (angle_error > 0.0f)))
         {
-            g_pitch_integral = Pitch_Test_Clamp(
-                g_pitch_integral + angle_error * PITCH_ANGLE_KI * PITCH_CONTROL_PERIOD_S,
+            g_pitch_integral = Pitch_Test_Clamp(g_pitch_integral +
+                angle_error * PITCH_ANGLE_KI * PITCH_CONTROL_PERIOD_S,
                 PITCH_INTEGRAL_LIMIT);
         }
         pitch_current = (int16_t)Pitch_Test_Clamp(
             (angle_error * PITCH_ANGLE_KP + g_pitch_integral) * PITCH_MOTOR_DIRECTION,
             PITCH_CURRENT_LIMIT);
     }
-
     if (pitch_control_enabled != 0U)
     {
+        /* 修改：沿用已采集的重力/摩擦补偿表和原来的比例，不重新拟合。 */
         g_pitch_gravity_ff = Pitch_Test_GravityFeedforward(current_angle);
         g_pitch_friction_ff = Pitch_Test_FrictionFeedforward(
-            (int16_t)((float)g_pitch_feedback.speed_rpm *
-                      PITCH_SPEED_FEEDBACK_DIRECTION),
+            (int16_t)((float)g_pitch_feedback.speed_rpm * PITCH_SPEED_FEEDBACK_DIRECTION),
             g_pitch_debug_error);
         pitch_current = (int16_t)Pitch_Test_Clamp(
             (float)pitch_current + g_pitch_gravity_ff + g_pitch_friction_ff,
             PITCH_CURRENT_LIMIT);
+        /* 修改：到达软限位只禁止继续向外，允许向内脱离限位。 */
+        if (((current_angle <= PITCH_ANGLE_MIN_DEG) && (pitch_current < 0)) ||
+            ((current_angle >= PITCH_ANGLE_MAX_DEG) && (pitch_current > 0)))
+        {
+            pitch_current = 0;
+            g_pitch_integral = 0.0f;
+            Yaw_LegacyPid_Clear(&g_pitch_speed_pid);
+        }
     }
     else
     {
@@ -1232,10 +1371,19 @@ void Pitch_Test_Update(void)
         g_pitch_friction_ff = 0.0f;
     }
 
-    big_yaw_current = Big_Yaw_Update();
-    yaw_current = Yaw_Update(&remote, &aim, aim_active, now_ms);
+    if (static_aim != 0U)
+    {
+        Static_DualYaw_Update(&aim, g_aim_active, &big, &small, now_ms,
+                              &big_yaw_current, &yaw_current);
+    }
+    else
+    {
+        /* 修改：原小陀螺补偿保留；旧ID2入口只允许遥控/串口，不接视觉。 */
+        big_yaw_current = Big_Yaw_Update();
+        yaw_current = Yaw_Update(&remote, &small, aim.aim_enabled, now_ms);
+    }
     g_pitch_debug_current = pitch_current;
-    /* 修改：CAN2统一发送ID1大Yaw补偿、ID2小Yaw和ID3 Pitch输出。 */
+    /* 修改：同一CAN帧统一发送ID1/ID2/ID3，两个Yaw来源互斥。 */
     if (DJI_6020_SendCurrent(&hcan2, big_yaw_current, yaw_current,
                              pitch_current, 0) != HAL_OK)
     {
@@ -1250,7 +1398,9 @@ void Pitch_Test_Update(void)
 
 uint32_t Pitch_Test_DebugPeriodMs(void)
 {
-    /* 修改：小陀螺自动启用快照；BY GET可继续记录停车和换向过程。 */
+    /* 修改：静止视觉保持原1秒快照，避免旧BY/YAW调试抢占输出。 */
+    if (g_static_aim_enabled != 0U) return PITCH_DEBUG_PERIOD_MS;
+    /* 小陀螺自动启用快照；BY GET可继续记录停车和换向过程。 */
     if ((g_big_yaw_enabled != 0U) || (g_big_yaw_debug_enabled != 0U))
     {
         return BIG_YAW_DEBUG_PERIOD_MS;
@@ -1266,12 +1416,11 @@ void Pitch_Test_DebugPrint(void)
     dji_6020_feedback_t big_yaw_feedback = {0};
     dji_6020_feedback_t yaw_feedback = {0};
     dji_6020_feedback_t pitch_feedback = {0};
-    static char message[512];
+    static char message[768];
     uint32_t now_ms = HAL_GetTick();
     uint32_t frame_age_ms;
     float yaw_angle;
     float pitch_angle;
-    float yaw_target;
     int yaw_limit;
     int pitch_limit;
     int length;
@@ -1282,7 +1431,8 @@ void Pitch_Test_DebugPrint(void)
         return;
     }
 
-    if ((g_big_yaw_enabled != 0U) || (g_big_yaw_debug_enabled != 0U))
+    if ((g_static_aim_enabled == 0U) &&
+        ((g_big_yaw_enabled != 0U) || (g_big_yaw_debug_enabled != 0U)))
     {
         uint32_t status_age_ms;
 
@@ -1343,10 +1493,11 @@ void Pitch_Test_DebugPrint(void)
         return;
     }
 
-    if (g_yaw_debug_enabled != 0U)
+    if ((g_static_aim_enabled == 0U) && (g_yaw_debug_enabled != 0U))
     {
         dji_6020_feedback_t yaw = {0};
         DJI_6020_GetFeedback(YAW_MOTOR_INDEX, &yaw);
+        now_ms = HAL_GetTick();
         /* 板上时间戳避免 Windows 串口缓冲影响收敛时间测量。 */
         length = snprintf(message, sizeof(message),
             "YAW:ms=%lu setms=%lu on=%u serial=%u a=%.2f t=%.2f "
@@ -1375,63 +1526,64 @@ void Pitch_Test_DebugPrint(void)
     DJI_6020_GetFeedback(BIG_YAW_MOTOR_INDEX, &big_yaw_feedback);
     DJI_6020_GetFeedback(YAW_MOTOR_INDEX, &yaw_feedback);
     DJI_6020_GetFeedback(PITCH_MOTOR_INDEX, &pitch_feedback);
-    frame_age_ms = (aim.valid_frame_count != 0U) ?
-                   (uint32_t)(now_ms - aim.last_rx_tick_ms) : UINT32_MAX;
+    now_ms = HAL_GetTick();
+    frame_age_ms = (aim.new_frame_count != 0U) ?
+        (uint32_t)(now_ms - aim.last_new_target_tick_ms) : UINT32_MAX;
     yaw_angle = Pitch_Test_GetAngle(&yaw_feedback);
     pitch_angle = Pitch_Test_GetAngle(&pitch_feedback);
-    yaw_target = (g_aim_active != 0U) ? g_aim_yaw_target_angle : g_yaw_target_angle;
     yaw_limit = (yaw_angle <= YAW_ANGLE_MIN_DEG) ? -1 :
                 ((yaw_angle >= YAW_ANGLE_MAX_DEG) ? 1 : 0);
     pitch_limit = (pitch_angle <= PITCH_ANGLE_MIN_DEG) ? -1 :
                   ((pitch_angle >= PITCH_ANGLE_MAX_DEG) ? 1 : 0);
 
-    /* a/t/yerr/perr 单位为度；cur 为命令/反馈电流，age 单位为毫秒。 */
+    /* 修改：原始协议保持右正/上正；DYA目标/速度为控制坐标的逆时针正。
+     * state：0停用、1跟踪、2刹停、3保持。age为新图像年龄，rxage为通信年龄。
+     * yv/ya/pv完整接收并显示，本版前馈系数为0；ct是相机航向，不是ID2编码器角。 */
     length = snprintf(message, sizeof(message),
-                      "AIM:enabled=%u active=%u valid=%u fresh=%u "
-                      "seq=%u yerr=%.2f perr=%.2f bytes=%lu frames=%lu new=%lu bad=%lu age=%lu "
-                      "Y:on=%u a=%.1f t=%.1f cur=%d/%d lim=%d "
-                      "BY:on=%u en=%u chz=%.1f trpm=%d rpm=%d cmd=%d "
-                      "P:on=%u a=%.1f t=%.1f cur=%d/%d lim=%d txfail=%lu "
-                      "IMU:yaw=%.2f roll=%.2f\r\n",
-                      (unsigned int)aim.aim_enabled,
-                      (unsigned int)g_aim_active,
-                      (unsigned int)aim.target_valid,
-                      (unsigned int)((aim.valid_frame_count != 0U) &&
-                                     (frame_age_ms <= VISION_AIM_TIMEOUT_MS)),
-                      (unsigned int)aim.seq,
-                      (double)aim.yaw_error_cdeg / 100.0,
-                      (double)aim.pitch_error_cdeg / 100.0,
-                      (unsigned long)aim.rx_byte_count,
-                      (unsigned long)aim.valid_frame_count,
-                      (unsigned long)aim.new_frame_count,
-                      (unsigned long)aim.checksum_error_count,
-                      (unsigned long)frame_age_ms,
-                      (unsigned int)DJI_6020_IsOnline(YAW_MOTOR_INDEX, now_ms,
-                                                     PITCH_MOTOR_TIMEOUT_MS),
-                      (double)yaw_angle,
-                      (double)yaw_target,
-                      (int)g_yaw_debug_current,
-                      (int)yaw_feedback.given_current,
-                      yaw_limit,
-                      (unsigned int)DJI_6020_IsOnline(BIG_YAW_MOTOR_INDEX,
-                                                     now_ms,
-                                                     PITCH_MOTOR_TIMEOUT_MS),
-                      (unsigned int)g_big_yaw_enabled,
-                      (double)chassis_status.chassis_z_speed_rpm,
-                      (int)g_big_yaw_debug_target_rpm,
-                      (int)big_yaw_feedback.speed_rpm,
-                      (int)g_big_yaw_debug_current,
-                      (unsigned int)DJI_6020_IsOnline(PITCH_MOTOR_INDEX, now_ms,
-                                                     PITCH_MOTOR_TIMEOUT_MS),
-                      (double)pitch_angle,
-                      (double)g_pitch_target_angle,
-                      (int)g_pitch_debug_current,
-                      (int)pitch_feedback.given_current,
-                      pitch_limit,
-                      (unsigned long)g_pitch_can_tx_fail,
-                      /* EKF 内部为弧度，串口统一输出角度（度）。 */
-                      (double)(imu->ekf.yaw * 57.29578f),
-                      (double)(imu->ekf.roll * 57.29578f));
+        "AIM:ms=%lu en=%u active=%u valid=%u fresh=%u seq=%u cap=%lu "
+        "ye=%.2f yv=%.2f ya=%.2f pe=%.2f pv=%.2f age=%lu rxage=%lu "
+        "bytes=%lu frames=%lu new=%lu bad=%lu "
+        "DYA:en=%u on=%u state=%u cy=%.2f ct=%.2f ce=%.2f total=%.2f "
+        "B:on=%u trpm=%.2f rpm=%d cmd=%d "
+        "S:on=%u a=%.2f trpm=%.2f rpm=%d cmd=%d lim=%d "
+        "P:on=%u state=%u a=%.2f t=%.2f e=%.2f trpm=%d rpm=%d cmd=%d fbI=%d lim=%d "
+        "txfail=%lu IMU:roll=%.2f\r\n",
+        (unsigned long)now_ms,
+        (unsigned int)aim.aim_enabled, (unsigned int)g_aim_active,
+        (unsigned int)aim.target_valid,
+        (unsigned int)Pitch_Test_AimIsActive(&aim, now_ms),
+        (unsigned int)aim.seq, (unsigned long)aim.capture_time_ms,
+        (double)aim.yaw_error_cdeg / 100.0,
+        (double)aim.yaw_velocity_cdeg_s / 100.0,
+        (double)aim.yaw_acceleration_cdeg_s2 / 100.0,
+        (double)aim.pitch_error_cdeg / 100.0,
+        (double)aim.pitch_velocity_cdeg_s / 100.0,
+        (unsigned long)frame_age_ms,
+        (unsigned long)((aim.valid_frame_count != 0U) ?
+            (uint32_t)(now_ms - aim.last_rx_tick_ms) : UINT32_MAX),
+        (unsigned long)aim.rx_byte_count,
+        (unsigned long)aim.valid_frame_count,
+        (unsigned long)aim.new_frame_count,
+        (unsigned long)aim.checksum_error_count,
+        (unsigned int)g_static_aim_enabled, (unsigned int)g_dual_yaw_active,
+        (unsigned int)g_dual_yaw_aim.state,
+        (double)(imu->ekf.yaw * 57.29578f),
+        (double)g_dual_yaw_aim.camera_target_deg,
+        (double)g_dual_yaw_aim.error_deg, (double)g_dual_yaw_aim.total_rpm,
+        (unsigned int)Pitch_Test_MotorOnline(&big_yaw_feedback, now_ms),
+        (double)g_big_yaw_debug_target_rpm,
+        (int)big_yaw_feedback.speed_rpm, (int)g_big_yaw_debug_current,
+        (unsigned int)Pitch_Test_MotorOnline(&yaw_feedback, now_ms),
+        (double)yaw_angle, (double)((g_dual_yaw_active != 0U) ?
+            g_dual_yaw_aim.small_ref_rpm : (float)g_yaw_debug_target_rpm),
+        (int)yaw_feedback.speed_rpm, (int)g_yaw_debug_current, yaw_limit,
+        (unsigned int)Pitch_Test_MotorOnline(&pitch_feedback, now_ms),
+        (unsigned int)g_pitch_aim_state,
+        (double)pitch_angle, (double)g_pitch_target_angle,
+        (double)g_pitch_debug_error, (int)g_pitch_debug_target_rpm,
+        (int)pitch_feedback.speed_rpm, (int)g_pitch_debug_current,
+        (int)pitch_feedback.given_current, pitch_limit,
+        (unsigned long)g_pitch_can_tx_fail, (double)(imu->ekf.roll * 57.29578f));
     if ((length > 0) && (length < (int)sizeof(message)))
     {
         (void)HAL_UART_Transmit_DMA(&huart6, (uint8_t *)message,

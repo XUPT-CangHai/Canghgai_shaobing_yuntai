@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* 修改：默认自瞄快照1s，ID1小陀螺快照50ms，显式ID2 Yaw调参20ms。 */
+/* 修改：静止双Yaw自瞄快照1s（TRACK/BRAKE/HOLD），小陀螺50ms，ID2调参20ms。 */
 #define PITCH_TUNING_DEBUG 1
 #define PITCH_DEBUG_PERIOD_MS 1000U
 

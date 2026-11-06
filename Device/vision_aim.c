@@ -90,6 +90,25 @@ static uint32_t Vision_Aim_ReadU32(const uint8_t *data)
            ((uint32_t)data[3] << 24);
 }
 
+/* 修改：固定22字节帧改用CRC16/MODBUS，CRC低字节位于frame[20]。 */
+static uint16_t Vision_Aim_Crc16(const uint8_t *data, uint16_t length)
+{
+    uint16_t crc = 0xFFFFU;
+    uint16_t i;
+    uint8_t bit;
+
+    for (i = 0U; i < length; i++)
+    {
+        crc ^= data[i];
+        for (bit = 0U; bit < 8U; bit++)
+        {
+            crc = (crc & 1U) ? (uint16_t)((crc >> 1) ^ 0xA001U) :
+                               (uint16_t)(crc >> 1);
+        }
+    }
+    return crc;
+}
+
 void Vision_Aim_Init(void)
 {
     g_vision_aim = (vision_aim_command_t){0};
@@ -141,11 +160,20 @@ void Vision_Aim_Invalidate(void)
 void Vision_Aim_Service(void)
 {
     uint32_t primask = __get_PRIMASK();
+    uint32_t now_ms;
 
     /* 与 USART6 命令、USB 目标更新互斥，避免刚收到新目标就被超时关闭。 */
     __disable_irq();
+    now_ms = HAL_GetTick();
+    /* 修改：旧seq保活不能维持旧目标；只有新图像可恢复target_valid。 */
+    if ((g_vision_aim.target_valid != 0U) &&
+        ((uint32_t)(now_ms - g_vision_aim.last_new_target_tick_ms) >
+         VISION_AIM_TIMEOUT_MS))
+    {
+        g_vision_aim.target_valid = 0U;
+    }
     if ((g_vision_aim.aim_enabled != 0U) &&
-        ((uint32_t)(HAL_GetTick() - g_vision_aim.last_target_tick_ms) >=
+        ((uint32_t)(now_ms - g_vision_aim.last_target_tick_ms) >=
          VISION_AIM_LOST_CLOSE_MS))
     {
         Vision_Aim_Disable();
@@ -159,10 +187,8 @@ void Vision_Aim_Service(void)
 void Vision_Aim_Receive(const uint8_t *data, uint32_t length)
 {
     uint32_t offset;
-    uint8_t i;
-    uint8_t checksum;
+    uint32_t now_ms;
     uint8_t sequence;
-    uint8_t previous_sequence;
 
     if ((data == 0) || (length == 0U))
     {
@@ -180,34 +206,41 @@ void Vision_Aim_Receive(const uint8_t *data, uint32_t length)
             continue;
         }
 
-        checksum = 0U;
-        for (i = 0U; i < VISION_AIM_FRAME_SIZE - 1U; i++)
-        {
-            checksum ^= g_frame[i];
-        }
-
         if ((g_frame[0] == 0xA5U) && (g_frame[1] == 0x5AU) &&
-            (checksum == g_frame[VISION_AIM_FRAME_SIZE - 1U]) &&
-            ((g_frame[2] == 0U) || (g_frame[2] == 1U)))
+            (Vision_Aim_Crc16(g_frame, VISION_AIM_FRAME_SIZE - 2U) ==
+             Vision_Aim_ReadU16(&g_frame[VISION_AIM_FRAME_SIZE - 2U])) &&
+            ((g_frame[3] == 0U) || (g_frame[3] == 1U)))
         {
-            sequence = g_frame[3];
-            previous_sequence = g_vision_aim.seq;
-            g_vision_aim.target_valid = g_frame[2];
-            g_vision_aim.seq = sequence;
-            g_vision_aim.capture_time_ms = Vision_Aim_ReadU32(&g_frame[4]);
-            g_vision_aim.yaw_error_cdeg =
-                (int16_t)Vision_Aim_ReadU16(&g_frame[8]);
-            g_vision_aim.pitch_error_cdeg =
-                (int16_t)Vision_Aim_ReadU16(&g_frame[10]);
-            g_vision_aim.last_rx_tick_ms = HAL_GetTick();
+            now_ms = HAL_GetTick();
+            sequence = g_frame[2];
+            g_vision_aim.last_rx_tick_ms = now_ms;
             g_vision_aim.valid_frame_count++;
-            if (g_vision_aim.target_valid != 0U)
+            /* 修改：丢目标优先于seq判重，同seq的valid=1不重新激活旧目标。 */
+            if (g_frame[3] == 0U)
             {
-                g_vision_aim.last_target_tick_ms = HAL_GetTick();
+                g_vision_aim.target_valid = 0U;
             }
-            if ((g_have_sequence == 0U) || (sequence != previous_sequence))
+            if ((g_have_sequence == 0U) || (sequence != g_vision_aim.seq))
             {
-                /* 只有序号变化才算新图像，重复帧不会再次叠加角度误差。 */
+                /* 修改：测量值和图像时间仅随新seq更新，不被重复保活包覆盖。 */
+                g_vision_aim.seq = sequence;
+                g_vision_aim.target_valid = g_frame[3];
+                g_vision_aim.capture_time_ms = Vision_Aim_ReadU32(&g_frame[4]);
+                g_vision_aim.yaw_error_cdeg =
+                    (int16_t)Vision_Aim_ReadU16(&g_frame[8]);
+                g_vision_aim.yaw_velocity_cdeg_s =
+                    (int16_t)Vision_Aim_ReadU16(&g_frame[10]);
+                g_vision_aim.yaw_acceleration_cdeg_s2 =
+                    (int32_t)Vision_Aim_ReadU32(&g_frame[12]);
+                g_vision_aim.pitch_error_cdeg =
+                    (int16_t)Vision_Aim_ReadU16(&g_frame[16]);
+                g_vision_aim.pitch_velocity_cdeg_s =
+                    (int16_t)Vision_Aim_ReadU16(&g_frame[18]);
+                if (g_vision_aim.target_valid != 0U)
+                {
+                    g_vision_aim.last_new_target_tick_ms = now_ms;
+                    g_vision_aim.last_target_tick_ms = now_ms;
+                }
                 g_vision_aim.new_frame_count++;
             }
             g_have_sequence = 1U;
