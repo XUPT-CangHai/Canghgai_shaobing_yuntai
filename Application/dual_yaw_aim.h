@@ -49,4 +49,25 @@ void Dual_Yaw_Aim_Update(dual_yaw_aim_t *state,
                          float max_small_rpm,
                          float dt_s);
 
+/* 修改：左中手动跟随，目标是相机世界航向；松杆后仍持续让ID2回中。
+ * 底盘、ID1实际转速均为逆时针正，ID2补足相机合成速度。
+ */
+void Dual_Yaw_Follow_Update(dual_yaw_aim_t *state,
+                            float camera_target_deg,
+                            float camera_yaw_deg,
+                            float small_angle_deg,
+                            float big_actual_rpm,
+                            float chassis_actual_rpm,
+                            float angle_kp_rpm_per_deg,
+                            float max_small_rpm,
+                            float dt_s);
+
+/* 修改：左中视觉保持时继续回中，只重新分配速度，不改变相机目标及状态。
+ * 刹停阶段不回中，由调用方在HOLD后使用；此入口不参与旋转中视觉。
+ */
+void Dual_Yaw_Aim_RecenterHold(dual_yaw_aim_t *state,
+                               float small_angle_deg,
+                               float angle_kp_rpm_per_deg,
+                               float max_small_rpm);
+
 #endif

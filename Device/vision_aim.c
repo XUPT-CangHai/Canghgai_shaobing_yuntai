@@ -21,12 +21,12 @@ static void Vision_Aim_CommandReset(void)
 
 static void Vision_Aim_Enable(void)
 {
-    /* 调试串口只切换自瞄使能；开启后必须等一帧新的 USB 目标。 */
+    /* 修改：自瞄使能由串口开指令锁存，不依赖遥控器；开启后等待新的USB目标。 */
     g_vision_aim.target_valid = 0U;
     g_have_sequence = 0U;
     g_vision_aim.aim_enabled = 1U;
     g_vision_aim.enable_count++;
-    /* 开启后若一直没看到目标，也从开启时刻开始计 10 秒。 */
+    /* 修改：保留最近目标时间供诊断，不再用它自动关闭自瞄。 */
     g_vision_aim.last_target_tick_ms = HAL_GetTick();
     Vision_Aim_CommandReset();
 }
@@ -119,7 +119,7 @@ void Vision_Aim_Init(void)
 
 void Vision_Aim_DebugUartStart(void)
 {
-    /* USART6：115200、8N1，接收 ASCII 开关命令；TX 仍供调试 DMA 输出。 */
+    /* 修改：USART6为460800、8N1；原ASCII开关命令不变，TX供自瞄诊断DMA输出。 */
     __HAL_UART_CLEAR_OREFLAG(&huart6);
     (void)HAL_UART_Receive_IT(&huart6, &g_debug_rx_byte, 1U);
 }
@@ -151,7 +151,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 
 void Vision_Aim_Invalidate(void)
 {
-    /* USB 断开等同于丢目标，由 Service 统一执行 10 秒自动关闭。 */
+    /* 修改：USB断开只使目标失效，自瞄开关保持，等待新目标或明确关指令。 */
     g_vision_aim.target_valid = 0U;
     g_frame_length = 0U;
     g_have_sequence = 0U;
@@ -162,7 +162,7 @@ void Vision_Aim_Service(void)
     uint32_t primask = __get_PRIMASK();
     uint32_t now_ms;
 
-    /* 与 USART6 命令、USB 目标更新互斥，避免刚收到新目标就被超时关闭。 */
+    /* 修改：与USART6命令、USB目标更新互斥；这里只判目标超时，不改变自瞄开关。 */
     __disable_irq();
     now_ms = HAL_GetTick();
     /* 修改：旧seq保活不能维持旧目标；只有新图像可恢复target_valid。 */
@@ -171,12 +171,6 @@ void Vision_Aim_Service(void)
          VISION_AIM_TIMEOUT_MS))
     {
         g_vision_aim.target_valid = 0U;
-    }
-    if ((g_vision_aim.aim_enabled != 0U) &&
-        ((uint32_t)(now_ms - g_vision_aim.last_target_tick_ms) >=
-         VISION_AIM_LOST_CLOSE_MS))
-    {
-        Vision_Aim_Disable();
     }
     if (primask == 0U)
     {

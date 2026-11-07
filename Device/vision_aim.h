@@ -5,7 +5,7 @@
 
 #define VISION_AIM_FRAME_SIZE 22U
 #define VISION_AIM_TIMEOUT_MS 100U /* 修改：按新图像时间判断新鲜度，保活不续期。 */
-#define VISION_AIM_LOST_CLOSE_MS 10000U /* 连续 10 秒无目标才关闭自瞄。 */
+/* 修改：无目标不自动关闭；使能只由zimiaokai/zimioaguan指令切换。 */
 
 /*
  * 修改：USB CDC视觉帧固定22字节、小端，不混收旧13字节帧：
@@ -41,12 +41,12 @@ typedef struct
 } vision_aim_command_t;
 
 void Vision_Aim_Init(void);
-/* 初始化 USART6 后调用：zimiaokai 开启，zimioaguan 关闭，无需遥控器。 */
+/* 修改：初始化USART6后调用；zimiaokai开启并保持，zimioaguan关闭，无需遥控器。 */
 void Vision_Aim_DebugUartStart(void);
 /* 可在 USB CDC 回调中调用；内部只解析和发布快照，不控制电机。 */
 void Vision_Aim_Receive(const uint8_t *data, uint32_t length);
 void Vision_Aim_Get(vision_aim_command_t *command);
-/* 由主循环调用，10 秒没有有效目标时自动关闭自瞄。 */
+/* 修改：主循环只将超过100ms的新图像置为无效，保留自瞄使能供刹停/保持。 */
 void Vision_Aim_Service(void);
 void Vision_Aim_Invalidate(void);
 

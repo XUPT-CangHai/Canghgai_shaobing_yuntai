@@ -12,6 +12,7 @@
 #define DUAL_YAW_EDGE_KP_RPM_PER_DEG    0.40f
 #define DUAL_YAW_EDGE_MARGIN_DEG        8.0f
 #define DUAL_YAW_BIG_MAX_RPM           25.0f
+#define DUAL_YAW_BIG_MOTOR_MAX_RPM    300.0f
 #define DUAL_YAW_HOLD_MAX_RPM          10.0f
 #define DUAL_YAW_TOTAL_BRAKE_RPM_S    800.0f
 #define DUAL_YAW_BIG_BRAKE_RPM_S      150.0f
@@ -81,6 +82,54 @@ static float Dual_Yaw_LimitSmall(float target_rpm,
     return Dual_Yaw_Clamp(target_rpm, -negative_limit, positive_limit);
 }
 
+/* 修改：手动、视觉跟踪和左中保持共用同一机械回中规则。 */
+static float Dual_Yaw_CenterRpm(float small_angle_deg)
+{
+    float kp = DUAL_YAW_CENTER_KP_RPM_PER_DEG;
+
+    if (small_angle_deg < DUAL_YAW_SMALL_MIN_DEG + DUAL_YAW_EDGE_MARGIN_DEG ||
+        small_angle_deg > DUAL_YAW_SMALL_MAX_DEG - DUAL_YAW_EDGE_MARGIN_DEG)
+    {
+        kp = DUAL_YAW_EDGE_KP_RPM_PER_DEG;
+    }
+    return kp * (small_angle_deg - DUAL_YAW_SMALL_CENTER_DEG);
+}
+
+static void Dual_Yaw_SplitSpeed(dual_yaw_aim_t *state,
+                                  float chassis_actual_rpm,
+                                  float small_angle_deg,
+                                  float angle_kp_rpm_per_deg,
+                                  float max_small_rpm,
+                                  float max_big_rpm,
+                                  uint8_t increase_big_share)
+{
+    float raw_small_rpm;
+    float needed_big_rpm;
+
+    /* 修改：相机世界速度=底盘实际速度+ID1实际速度+ID2相对速度。 */
+    raw_small_rpm = state->total_rpm - chassis_actual_rpm - state->filtered_big_rpm;
+    state->small_ref_rpm = Dual_Yaw_LimitSmall(raw_small_rpm,
+                                               small_angle_deg,
+                                               angle_kp_rpm_per_deg,
+                                               max_small_rpm);
+    if (increase_big_share != 0U)
+    {
+        /* 小Yaw受限时提高大Yaw分担，目标速度仍按实际反馈给ID2补足。 */
+        needed_big_rpm = state->total_rpm - chassis_actual_rpm - state->small_ref_rpm;
+        if (raw_small_rpm > state->small_ref_rpm && needed_big_rpm > state->big_ref_rpm)
+        {
+            state->big_ref_rpm = needed_big_rpm;
+        }
+        else if (raw_small_rpm < state->small_ref_rpm && needed_big_rpm < state->big_ref_rpm)
+        {
+            state->big_ref_rpm = needed_big_rpm;
+        }
+        state->big_ref_rpm = Dual_Yaw_Clamp(state->big_ref_rpm,
+                                            -max_big_rpm,
+                                            max_big_rpm);
+    }
+}
+
 void Dual_Yaw_Aim_Reset(dual_yaw_aim_t *state)
 {
     memset(state, 0, sizeof(*state));
@@ -99,9 +148,6 @@ void Dual_Yaw_Aim_Update(dual_yaw_aim_t *state,
                          float dt_s)
 {
     float target_total_rpm;
-    float raw_small_rpm;
-    float center_kp;
-    float needed_big_rpm;
     uint8_t new_target_frame;
 
     if (dt_s <= 0.0f)
@@ -156,15 +202,8 @@ void Dual_Yaw_Aim_Update(dual_yaw_aim_t *state,
                                                   state->total_rpm,
                                                   dt_s,
                                                   DUAL_YAW_BIG_FILTER_TAU_S);
-        center_kp = DUAL_YAW_CENTER_KP_RPM_PER_DEG;
-        if (small_angle_deg < DUAL_YAW_SMALL_MIN_DEG + DUAL_YAW_EDGE_MARGIN_DEG ||
-            small_angle_deg > DUAL_YAW_SMALL_MAX_DEG - DUAL_YAW_EDGE_MARGIN_DEG)
-        {
-            center_kp = DUAL_YAW_EDGE_KP_RPM_PER_DEG;
-        }
         state->big_ref_rpm = Dual_Yaw_Clamp(
-            state->big_lowpass_rpm +
-                center_kp * (small_angle_deg - DUAL_YAW_SMALL_CENTER_DEG),
+            state->big_lowpass_rpm + Dual_Yaw_CenterRpm(small_angle_deg),
             -DUAL_YAW_BIG_MAX_RPM,
             DUAL_YAW_BIG_MAX_RPM);
     }
@@ -199,26 +238,78 @@ void Dual_Yaw_Aim_Update(dual_yaw_aim_t *state,
         state->big_lowpass_rpm = 0.0f;
     }
 
-    /* 修改：扣除ID1实际余转，而非尚未实现的指令速度，保持相机合成速度。 */
-    raw_small_rpm = state->total_rpm - state->filtered_big_rpm;
-    state->small_ref_rpm = Dual_Yaw_LimitSmall(raw_small_rpm,
-                                               small_angle_deg,
-                                               angle_kp_rpm_per_deg,
-                                               max_small_rpm);
-    if (state->state == DUAL_YAW_AIM_TRACK)
+    /* 修改：静止视觉仍按原规则分配，TRACK阶段才提高大Yaw限位分担。 */
+    Dual_Yaw_SplitSpeed(state, 0.0f, small_angle_deg, angle_kp_rpm_per_deg,
+                         max_small_rpm, DUAL_YAW_BIG_MAX_RPM,
+                         (uint8_t)(state->state == DUAL_YAW_AIM_TRACK));
+}
+
+void Dual_Yaw_Follow_Update(dual_yaw_aim_t *state,
+                            float camera_target_deg,
+                            float camera_yaw_deg,
+                            float small_angle_deg,
+                            float big_actual_rpm,
+                            float chassis_actual_rpm,
+                            float angle_kp_rpm_per_deg,
+                            float max_small_rpm,
+                            float dt_s)
+{
+    float target_total_rpm;
+    float follow_trim_rpm;
+
+    if (dt_s <= 0.0f)
     {
-        /* 修改：ID2受到速度或机械限位约束时，允许ID1立即增加对应方向分担。 */
-        needed_big_rpm = state->total_rpm - state->small_ref_rpm;
-        if (raw_small_rpm > state->small_ref_rpm && needed_big_rpm > state->big_ref_rpm)
-        {
-            state->big_ref_rpm = needed_big_rpm;
-        }
-        else if (raw_small_rpm < state->small_ref_rpm && needed_big_rpm < state->big_ref_rpm)
-        {
-            state->big_ref_rpm = needed_big_rpm;
-        }
-        state->big_ref_rpm = Dual_Yaw_Clamp(state->big_ref_rpm,
-                                            -DUAL_YAW_BIG_MAX_RPM,
-                                            DUAL_YAW_BIG_MAX_RPM);
+        dt_s = 0.002f;
     }
+    if (state->initialized == 0U)
+    {
+        /* 修改：入口航向由父层锚定；从当前实际ID1转速开始抵消，避免假定已停。 */
+        state->initialized = 1U;
+        state->filtered_big_rpm = big_actual_rpm;
+    }
+    state->state = DUAL_YAW_AIM_TRACK;
+    state->camera_target_deg = Dual_Yaw_WrapDeg(camera_target_deg);
+    state->error_deg = Dual_Yaw_WrapDeg(state->camera_target_deg - camera_yaw_deg);
+    state->filtered_big_rpm = Dual_Yaw_Filter(state->filtered_big_rpm,
+                                              big_actual_rpm,
+                                              dt_s,
+                                              DUAL_YAW_FEEDBACK_FILTER_TAU_S);
+    target_total_rpm = Dual_Yaw_Clamp(angle_kp_rpm_per_deg * state->error_deg,
+                                      -max_small_rpm,
+                                      max_small_rpm);
+    state->total_rpm = Dual_Yaw_Filter(state->total_rpm,
+                                       target_total_rpm,
+                                       dt_s,
+                                       DUAL_YAW_TOTAL_FILTER_TAU_S);
+    state->big_lowpass_rpm = Dual_Yaw_Filter(state->big_lowpass_rpm,
+                                             state->total_rpm,
+                                             dt_s,
+                                             DUAL_YAW_BIG_FILTER_TAU_S);
+    follow_trim_rpm = Dual_Yaw_Clamp(
+        state->big_lowpass_rpm + Dual_Yaw_CenterRpm(small_angle_deg),
+        -DUAL_YAW_BIG_MAX_RPM, DUAL_YAW_BIG_MAX_RPM);
+    /* 修改：底盘反补偿独立于跟随修正限幅，普通拨轮旋转同样保持枪口航向。 */
+    state->big_ref_rpm = Dual_Yaw_Clamp(-chassis_actual_rpm + follow_trim_rpm,
+                                         -DUAL_YAW_BIG_MOTOR_MAX_RPM,
+                                         DUAL_YAW_BIG_MOTOR_MAX_RPM);
+    Dual_Yaw_SplitSpeed(state, chassis_actual_rpm, small_angle_deg,
+                         angle_kp_rpm_per_deg, max_small_rpm,
+                         DUAL_YAW_BIG_MOTOR_MAX_RPM, 1U);
+}
+
+void Dual_Yaw_Aim_RecenterHold(dual_yaw_aim_t *state,
+                               float small_angle_deg,
+                               float angle_kp_rpm_per_deg,
+                               float max_small_rpm)
+{
+    if (state->state != DUAL_YAW_AIM_HOLD)
+    {
+        return;
+    }
+    /* 修改：只移动大小Yaw之间的分配，原世界航向保持目标与总速度均保留。 */
+    state->big_ref_rpm = Dual_Yaw_Clamp(Dual_Yaw_CenterRpm(small_angle_deg),
+                                         -DUAL_YAW_BIG_MAX_RPM,
+                                         DUAL_YAW_BIG_MAX_RPM);
+    Dual_Yaw_SplitSpeed(state, 0.0f, small_angle_deg, angle_kp_rpm_per_deg,
+                         max_small_rpm, DUAL_YAW_BIG_MAX_RPM, 1U);
 }

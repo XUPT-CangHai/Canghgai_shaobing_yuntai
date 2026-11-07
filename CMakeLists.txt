@@ -53,6 +53,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     BSP/bsp_remote.c
     Device/dji_motor.c
     Device/remote_control.c
+    Device/gimbal_heading_link.c # 修改：USART1回传最终相机相对朝向。
     Device/vision_aim.c
     Device/WIT_Gyro.c
     Device/BMI088driver.c

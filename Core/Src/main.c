@@ -37,6 +37,7 @@
 /* USER CODE BEGIN Includes */
 #include "shoot_test.h"
 #include "pitch_test.h"
+#include "gimbal_heading_link.h"
 #include "vision_aim.h"
 /* USER CODE END Includes */
 
@@ -66,7 +67,6 @@ static uint32_t control_tick_ms;
 static uint32_t g_imu_tick_ms;
 static uint32_t imu_debug_warmup_tick_ms;
 static uint32_t vision_imu_tick_ms;
-static uint32_t aim_debug_tick_ms;
 static uint32_t boot_tick_ms;
 static uint16_t vision_frame_seq;
 typedef enum
@@ -331,7 +331,6 @@ int main(void)
   g_imu_tick_ms = control_tick_ms;
 
   vision_imu_tick_ms = control_tick_ms;
-  aim_debug_tick_ms = control_tick_ms;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -353,7 +352,8 @@ int main(void)
         IMU_System_Update(imu_dt);
       }
       Pitch_Test_Update();
-      /* Shooter output remains disabled during IMU and gimbal observation. */
+      /* 修改：主人确认恢复原发射门控，左中右上发射，左中右中仅拨弹。 */
+      Shoot_Test_Update();
       /* 每2ms更新CAN2：ID1大Yaw小陀螺补偿、ID2小Yaw、ID3 Pitch。 */
 
     }
@@ -365,13 +365,10 @@ int main(void)
       Vision_SendImuFrame();
     }
 
-    /* 修改：USART6按模式输出，ID1小陀螺50ms，ID2调参20ms，默认自瞄1s。 */
-    if ((uint32_t)(HAL_GetTick() - aim_debug_tick_ms) >= Pitch_Test_DebugPeriodMs())
-    {
-      aim_debug_tick_ms = HAL_GetTick();
-      Pitch_Test_DebugPrint();
-      /* IMU_DebugPrint(); */
-    }
+    /* 修改：USART6独立输出PDBG 10ms和AIM概要100ms，DMA忙跳过遥测，不等待。 */
+    Pitch_Test_TelemetryService();
+    /* 修改：USART1每10ms回传枪口相对底盘朝向，不占用视觉USB或调试USART6。 */
+    Gimbal_Heading_Link_Update();
     IMU_StatusLed_Update();
   }
   /* USER CODE END 3 */
