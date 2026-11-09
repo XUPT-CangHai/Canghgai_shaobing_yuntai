@@ -18,8 +18,11 @@
 
 /* CAN1 0x200: ID1不用，ID2左摩擦轮，ID3右摩擦轮，ID4拨弹轮。 */
 /* 实车确认：ID4 拨弹轮需要反向旋转。 */
-/* 修改：主人指定摩擦轮6750rpm；拨弹保持900rpm，保留原旋转方向。 */
-#define TRIGGER_TARGET_RPM     (-900)
+/* 修改：摩擦轮保持6750rpm；串口定时拨弹仍沿原方向使用1200rpm。 */
+#define TRIGGER_TARGET_RPM     (-1200)
+#define TRIGGER_REMOTE_MAX_RPM  3000
+#define TRIGGER_DIAL_RANGE      660
+#define TRIGGER_DIAL_DEADZONE   10
 #define LEFT_FRIC_TARGET_RPM   (-6750)
 #define RIGHT_FRIC_TARGET_RPM   6750
 
@@ -49,6 +52,25 @@ static uint8_t g_serial_locked;
 static uint32_t g_serial_start_ms;
 static uint32_t g_serial_duration_ms;
 static uint32_t g_serial_seq;
+
+/* 修改：遥控拨轮回中停拨弹，两侧比例调速；正值沿原负转速送弹，负值反转。
+ * 有效遥控允许到±700，先按额定±660钳制，确保目标不超过±3000rpm。 */
+static int16_t Shoot_Test_DialTarget(int16_t input)
+{
+    if ((input >= -TRIGGER_DIAL_DEADZONE) && (input <= TRIGGER_DIAL_DEADZONE))
+    {
+        return 0;
+    }
+    if (input > TRIGGER_DIAL_RANGE)
+    {
+        input = TRIGGER_DIAL_RANGE;
+    }
+    else if (input < -TRIGGER_DIAL_RANGE)
+    {
+        input = -TRIGGER_DIAL_RANGE;
+    }
+    return (int16_t)(-(int32_t)input * TRIGGER_REMOTE_MAX_RPM / TRIGGER_DIAL_RANGE);
+}
 
 static void Shoot_Test_ClearControl(void)
 {
@@ -202,7 +224,7 @@ void Shoot_Test_Update(void)
         }
     }
 
-    /* 左开关中档是整车控制总使能；右开关中档只运行ID4拨弹轮。 */
+    /* 修改：左中右中只开拨弹，左中右上持续开摩擦轮；两档拨弹均由拨轮调速。 */
     if ((g_remote_online != 0U) && (g_remote_valid != 0U) &&
         (remote.switch_position[RC_S_LEFT] == RC_SW_MID))
     {
@@ -250,9 +272,12 @@ void Shoot_Test_Update(void)
     }
     else
     {
+        /* 修改：串口动作独立于拨轮；遥控FIRE在拨轮回中时仅停拨弹，摩擦轮仍转。 */
+        int16_t trigger_target = (g_serial_mode != 0U) ? TRIGGER_TARGET_RPM :
+                                 Shoot_Test_DialTarget(remote.channel[4]);
         g_target_rpm[0] = ((g_mode == SHOOT_MODE_TRIGGER) ||
                            (g_mode == SHOOT_MODE_FIRE)) ?
-                          TRIGGER_TARGET_RPM : 0;
+                          trigger_target : 0;
         g_target_rpm[1] = (g_mode == SHOOT_MODE_FIRE) ?
                           LEFT_FRIC_TARGET_RPM : 0;
         g_target_rpm[2] = (g_mode == SHOOT_MODE_FIRE) ?

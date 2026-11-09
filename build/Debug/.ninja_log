@@ -32,8 +32,8 @@
 1418	1986	8153243338911663	CMakeFiles/shaobing_yuntai.dir/Device/ist8310driver.c.obj	a9afbb7a642df762
 1481	2082	8153243339550249	CMakeFiles/shaobing_yuntai.dir/Algorithm/pid.c.obj	6a7f6072c3977ce9
 1451	2556	8153243339240972	CMakeFiles/shaobing_yuntai.dir/Device/ist8310driver_middleware.c.obj	3ea9496ebc7087fb
-5	368	8157651109132235	CMakeFiles/shaobing_yuntai.dir/Application/shoot_test.c.obj	f84f934d646374de
-24	468	8157636679792352	CMakeFiles/shaobing_yuntai.dir/Application/pitch_test.c.obj	646def9cdca30a5
+8	1330	8159350846591650	CMakeFiles/shaobing_yuntai.dir/Application/shoot_test.c.obj	f84f934d646374de
+5	442	8158457458450738	CMakeFiles/shaobing_yuntai.dir/Application/pitch_test.c.obj	646def9cdca30a5
 1607	2697	8153243340803111	cmake/stm32cubemx/CMakeFiles/STM32_Drivers.dir/__/__/Core/Src/system_stm32f4xx.c.obj	d2b23dd0719a8b29
 1635	2779	8153243341094245	cmake/stm32cubemx/CMakeFiles/STM32_Drivers.dir/__/__/Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_pcd.c.obj	ff036e8eb27896ed
 1674	2725	8153243341484460	cmake/stm32cubemx/CMakeFiles/STM32_Drivers.dir/__/__/Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_pcd_ex.c.obj	a0e1e035bc333782
@@ -66,10 +66,10 @@
 3068	3952	8153243355404993	cmake/stm32cubemx/CMakeFiles/USB_Device_Library.dir/__/__/Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ctlreq.c.obj	d651a68ab383d0e3
 3115	3891	8153243355882363	cmake/stm32cubemx/CMakeFiles/USB_Device_Library.dir/__/__/Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ioreq.c.obj	2f380b1861b7b89c
 3142	3951	8153243356153668	cmake/stm32cubemx/CMakeFiles/USB_Device_Library.dir/__/__/Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Src/usbd_cdc.c.obj	8719b0ce7b336797
-368	1370	8157651112770481	shaobing_yuntai.elf	f3c6578a2feaa678
+1331	2592	8159350859822186	shaobing_yuntai.elf	f3c6578a2feaa678
 15	2241	8154903834797423	CMakeFiles/shaobing_yuntai.dir/Device/imu_system.c.obj	2b1a64364a4e66a3
-5	235	8157651796563496	build.ninja	55d22d024df750c4
-5	235	8157651796460310	D:/沧海电控/电控资料及代码/code/CangHai_RoboMaster_Electrical/shaobing_yuntai/build/Debug/cmake_install.cmake	55d22d024df750c4
-5	235	8157651796511467	D:/沧海电控/电控资料及代码/code/CangHai_RoboMaster_Electrical/shaobing_yuntai/build/Debug/cmake/stm32cubemx/cmake_install.cmake	55d22d024df750c4
+5	235	8159364910238674	build.ninja	55d22d024df750c4
+5	235	8159364910141777	D:/沧海电控/电控资料及代码/code/CangHai_RoboMaster_Electrical/shaobing_yuntai/build/Debug/cmake_install.cmake	55d22d024df750c4
+5	235	8159364910188791	D:/沧海电控/电控资料及代码/code/CangHai_RoboMaster_Electrical/shaobing_yuntai/build/Debug/cmake/stm32cubemx/cmake_install.cmake	55d22d024df750c4
 1004	1251	8156753759079620	CMakeFiles/shaobing_yuntai.dir/Application/dual_yaw_aim.c.obj	7781a2415de8a1fe
 324	644	8157498155278565	CMakeFiles/shaobing_yuntai.dir/Device/gimbal_heading_link.c.obj	f27d156bc6403840
